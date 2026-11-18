@@ -1,0 +1,30 @@
+{
+  "accounts": [
+    {
+      "tag": "work",
+      "label": "Work",
+      "email": "me@example.com",
+      "config_dir": "",
+      "keychain": "Claude Code-credentials",
+      "chrome_profile": "Profile 1"
+    },
+    {
+      "tag": "home",
+      "label": "Home",
+      "email": "me@example.org",
+      "config_dir": "~/.claude.home",
+      "keychain": "Claude Code-credentials-0a1b2c3d",
+      "chrome_profile": "Profile 2"
+    }
+  ],
+  "order": ["work", "home"],
+  "pool": "~/.claude-shared",
+  "active_file": "~/.claude-active",
+  "notify": ["~/bin/notify.sh", "--quiet"],
+  "quota_api": "http://127.0.0.1:7470/api/claude-quota?fresh=1",
+  "quota_cache": "~/.local/state/claude-quota/claude-quota.json",
+  "quota_headers": {},
+  "timezone": "Europe/Madrid",
+  "companion_id": "latidos.claude-relaunch",
+  "settings": {"soon_days": 3, "notify_days": 2, "login_timeout_seconds": 300}
+}

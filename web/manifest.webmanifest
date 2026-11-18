@@ -1,0 +1,13 @@
+{
+  "name": "Latidos",
+  "short_name": "Latidos",
+  "description": "Consumo de tokens de Claude Code, vivo",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#07080c",
+  "theme_color": "#07080c",
+  "icons": [
+    {"src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png"},
+    {"src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml"}
+  ]
+}

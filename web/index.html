@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Latidos</title>
+<meta name="description" content="Claude Code token use, live" data-i18n-content="meta.description">
+<meta name="theme-color" content="#f4f1ea" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#07080c" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<script src="/theme.js"></script>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="nebula" aria-hidden="true"></div>
+
+<header class="bar">
+  <div class="brand">
+    <span class="heart" aria-hidden="true"></span>
+    <span class="brand-name">latidos</span>
+    <span id="status" class="status" role="status" aria-live="polite" data-i18n="status.connecting">connecting…</span>
+  </div>
+  <nav class="ranges" aria-label="Time range" data-i18n-aria-label="ranges.aria">
+    <button type="button" data-range="hoy" data-i18n="range.btn.hoy">Today</button>
+    <button type="button" data-range="24h" data-i18n="range.btn.24h">24 h</button>
+    <button type="button" data-range="7d" data-i18n="range.btn.7d">7 days</button>
+    <button type="button" data-range="30d" data-i18n="range.btn.30d">30 days</button>
+    <button type="button" data-range="90d" data-i18n="range.btn.90d">90 days</button>
+    <button type="button" data-range="todo" data-i18n="range.btn.todo">All</button>
+    <button type="button" id="custom-range" class="custom" hidden></button>
+  </nav>
+  <div class="tools">
+    <button type="button" id="currency" class="chip" title="Switch main currency (C)" data-i18n-title="tools.currency">€</button>
+    <button type="button" id="sound" class="chip" aria-pressed="false" data-i18n-title="tools.sound.off" data-i18n-aria-label="tools.sound">🔇</button>
+    <button type="button" id="theme" class="chip" title="Theme: system (T)" aria-label="Theme" data-i18n-aria-label="tools.theme">◐</button>
+    <button type="button" id="lang" class="chip lang-chip" title="Language: English. Switch to Español" aria-label="Language: English">🇬🇧</button>
+  </div>
+</header>
+
+<main>
+  <section class="stage" aria-label="Use by project" data-i18n-aria-label="stage.aria">
+    <canvas id="eco" aria-hidden="true"></canvas>
+    <canvas id="sky" aria-hidden="true"></canvas>
+    <div class="field" aria-hidden="true"></div>
+    <button type="button" id="zoom-reset" class="chip zoom-chip" hidden title="Back to the full view (0)" data-i18n-title="zoom.reset"></button>
+    <div id="labels" class="labels"></div>
+    <div id="floaters" class="floaters" aria-hidden="true"></div>
+
+    <div class="left-col">
+    <div class="hero">
+      <p class="eyebrow" id="hero-range">Last 30 days</p>
+      <div class="big" id="hero-tokens" aria-live="off"></div>
+      <p class="big-unit" data-i18n="hero.unit">tokens processed</p>
+      <p class="money"><span id="hero-money-main"></span></p>
+      <p class="money-note" data-i18n="hero.money.note">at API prices, had you paid per use</p>
+      <p class="mix q-roi" id="q-roi" hidden></p>
+      <p class="mix" id="hero-mix"></p>
+      <p class="mix cursor-line" id="hero-cursor" hidden></p>
+      <div class="ecg">
+        <canvas id="ecg" aria-hidden="true"></canvas>
+        <p class="ecg-text" id="ecg-text">–</p>
+      </div>
+    </div>
+    </div>
+
+    <!-- Optional account cards from a local launcher (Claude quota per account, Cursor spend):
+         live calls fly out of the account's card. Each card shows or hides its account,
+         carries its share of the spend and its login's expiry (L-158..L-162). -->
+    <aside class="quota" id="quota" aria-label="Accounts: Claude quota and Cursor spend" data-i18n-aria-label="quota.aria" hidden>
+      <p class="eyebrow"><span class="q-title" data-i18n="quota.title">Accounts</span> <span id="q-when"></span></p>
+      <div class="q-list" id="q-list"></div>
+      <p class="q-note" id="q-note" role="status" aria-live="polite" hidden></p>
+    </aside>
+  </section>
+
+  <section class="river-wrap" aria-label="River of time" data-i18n-aria-label="river.aria">
+    <div class="river-head">
+      <p class="eyebrow" data-i18n="river.title">The river of time</p>
+      <p class="hint" data-i18n="river.hint">drag to pick a stretch · tap a day to open it</p>
+    </div>
+    <div class="river" id="river-box">
+      <canvas id="river" aria-hidden="true"></canvas>
+      <div id="moments" class="moments"></div>
+      <div id="river-tip" class="tip" hidden></div>
+      <div id="brush" class="brush" hidden></div>
+    </div>
+    <div class="days" id="days" aria-label="Day by day" data-i18n-aria-label="days.aria"></div>
+  </section>
+
+  <section class="ranking" aria-label="Detail by project" data-i18n-aria-label="rank.aria">
+    <div class="rank-head">
+      <p class="eyebrow" data-i18n="rank.title">By project</p>
+      <p class="hint" id="rank-hint"></p>
+    </div>
+    <ol id="rank" class="rank"></ol>
+    <div class="cursor-rank" id="cursor-rank-wrap" hidden>
+      <div class="rank-head"><p class="eyebrow" data-i18n="rank.cursor.title">Cursor by project</p><p class="hint" data-i18n="rank.cursor.hint">cost and tokens from your Cursor usage history; titles and projects from this Mac</p></div>
+      <ol id="cursor-rank" class="rank"></ol>
+      <ul id="cursor-models" class="cursor-models"></ul>
+    </div>
+    <div class="models">
+      <p class="eyebrow" data-i18n="models.title">Models</p>
+      <ul id="models"></ul>
+    </div>
+    <p class="footnote" id="footnote"></p>
+  </section>
+</main>
+
+<div id="sheet" class="sheet" hidden>
+  <div class="sheet-card card" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+    <button type="button" class="close" id="sheet-close" aria-label="Close" data-i18n-aria-label="sheet.close">✕</button>
+    <p class="eyebrow" id="sheet-eyebrow">Project</p>
+    <h2 id="sheet-title"></h2>
+    <button type="button" class="sheet-edit" id="sheet-rename" data-i18n="sheet.rename">Rename</button>
+    <form id="sheet-rename-form" class="name-form" hidden>
+      <label for="sheet-rename-input" data-i18n="sheet.rename.label">New name</label>
+      <input id="sheet-rename-input" type="text" maxlength="60" autocomplete="off" spellcheck="false">
+      <button type="submit" data-i18n="sheet.save">Save</button>
+      <button type="button" id="sheet-rename-cancel" data-i18n="sheet.cancel">Cancel</button>
+      <p class="form-err" role="alert" hidden></p>
+    </form>
+    <p class="sheet-stats" id="sheet-stats"></p>
+    <p class="origins sheet-origins" id="sheet-origins" hidden></p>
+    <div class="sheet-sort" role="group" aria-label="Sort tasks" data-i18n-aria-label="sheet.sort.aria">
+      <button type="button" id="sheet-sort-usd" aria-pressed="true" data-i18n="sheet.sort.usd">Cost</button>
+      <button type="button" id="sheet-sort-recent" aria-pressed="false" data-i18n="sheet.sort.recent">Recent</button>
+    </div>
+    <ol id="sheet-tasks" class="tasks"></ol>
+    <datalist id="sheet-projects"></datalist>
+  </div>
+</div>
+
+<script src="/i18n.js"></script>
+<script src="/format.js"></script>
+<script src="/sound.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

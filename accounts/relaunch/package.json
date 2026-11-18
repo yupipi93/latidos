@@ -1,0 +1,19 @@
+{
+	"name": "claude-relaunch",
+	"displayName": "Claude tab relaunch",
+	"description": "Reopens given Claude Code tabs on request so they start a fresh Claude process under the current account (used by the account switch tools in Latidos' accounts/ folder).",
+	"version": "0.3.0",
+	"publisher": "latidos",
+	"license": "MIT",
+	"engines": {
+		"vscode": "^1.80.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"activationEvents": [
+		"onStartupFinished"
+	],
+	"main": "./extension.js",
+	"extensionDependencies": []
+}

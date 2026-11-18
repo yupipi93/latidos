@@ -1,0 +1,11 @@
+{
+  "owner": "Alex, platform engineer at Example Corp; works for two clients and builds own tools.",
+  "employer": "Example Corp",
+  "clients": [
+    {"name": "Demo Client", "about": "Board DEMO. Products: Portal (repo demo-portal), Billing (repo demo-billing, demo-* cloud projects)."},
+    {"name": "Other Client", "about": "Board OTHER. Data platform (repo other-data-iac)."},
+    {"name": "Example Corp", "about": "The employer (kind internal): time booking, internal tickets (board OPS), team management."}
+  ],
+  "tools": "Own tools (kind tool): Latidos, repo-x dashboard, the agent kit.",
+  "notes": "A session that works a DEMO ticket is Demo Client even when it runs in a tool's folder."
+}

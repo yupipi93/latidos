@@ -1,0 +1,13 @@
+{
+  "accounts": [
+    {"tag": "lt", "label": "Work", "email": "work@example.com", "config_dir": "",
+     "keychain": "Claude Code-credentials", "chrome_profile": "Profile 1"},
+    {"tag": "mt", "label": "Home", "email": "home@example.com", "config_dir": "~/.claude.mt",
+     "keychain": "Claude Code-credentials-00000001", "chrome_profile": "Profile 2"},
+    {"tag": "na", "label": "Spare", "email": "spare@example.com", "config_dir": "~/.claude.na",
+     "keychain": "Claude Code-credentials-00000002", "chrome_profile": "Profile 3"}
+  ],
+  "order": ["lt", "mt", "na"],
+  "quota_api": "http://127.0.0.1:9/api/claude-quota?fresh=1",
+  "timezone": "Europe/Madrid"
+}

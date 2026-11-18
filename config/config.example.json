@@ -1,0 +1,22 @@
+{
+  "roots": [
+    "~/.claude/projects"
+  ],
+  "allow_home_folders": [],
+  "code_dir": "~/code",
+  "projects_dir": "~/code/projects",
+  "workspaces": [
+    "agent-skeleton"
+  ],
+  "accounts_url": "",
+  "account_colors": {
+    "work": "#d81b4a",
+    "personal": "#2f6fec"
+  },
+  "account_logins": {
+    "work": "~/.claude",
+    "personal": "~/.claude-personal"
+  },
+  "account_control": [],
+  "label": "local.latidos"
+}

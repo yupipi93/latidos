@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360" role="img" aria-label="Footprint: 43 MB of RAM, 0 percent CPU between scans, 45 MB database, no dependencies">
+<defs>
+  <clipPath id="frame"><rect width="1200" height="360" rx="24"/></clipPath>
+  <radialGradient id="n"><stop offset="0" stop-color="#199e70" stop-opacity=".20"/><stop offset="1" stop-color="#199e70" stop-opacity="0"/></radialGradient>
+</defs>
+<g clip-path="url(#frame)" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif">
+  <rect width="1200" height="360" fill="#07080c"/>
+  <ellipse cx="300" cy="40" rx="560" ry="220" fill="url(#n)"/>
+  <rect x=".5" y=".5" width="1199" height="359" rx="24" fill="none" stroke="rgba(238,240,244,.10)"/>
+  <text x="66" y="54" font-size="16" font-weight="600" letter-spacing="3.5" fill="#a0a6b1">LIGHT ON YOUR MACHINE</text>
+  <text x="1134" y="54" font-size="13.5" fill="#6b717c" text-anchor="end">measured: the live service after 16 h, 107k calls in its history</text>
+  <g transform="translate(66.0,84)">
+    <rect width="252" height="226" rx="20" fill="#10121a" stroke="#199e70" stroke-opacity=".35"/>
+    <text x="22" y="34" font-size="13" font-weight="700" letter-spacing="2.5" fill="#199e70">RAM</text>
+    <text x="22" y="76" font-size="38" font-weight="600" fill="#eef0f4">43 MB</text>
+    <g transform="translate(66,118)"><circle r="40" fill="none" stroke="#199e70" stroke-opacity=".16" stroke-width="10"/><circle r="40" fill="none" stroke="#199e70" stroke-width="10" stroke-linecap="round" transform="rotate(-90)" stroke-dasharray="0 251.3"><animate attributeName="stroke-dasharray" values="0 251.3;10.6 251.3;10.6 251.3" keyTimes="0;.25;1" dur="5s" repeatCount="indefinite"/></circle><text y="6" font-size="15" font-weight="700" text-anchor="middle" fill="#199e70">4 %</text><text x="60" y="-6" font-size="13" fill="#a0a6b1">the rest is free</text><text x="60" y="13" font-size="13" fill="#6b717c">of 1 GB</text></g>
+    <text x="22" y="206" font-size="13" fill="#a0a6b1">resident memory</text>
+  </g>
+  <g transform="translate(338.0,84)">
+    <rect width="252" height="226" rx="20" fill="#10121a" stroke="#3987e5" stroke-opacity=".35"/>
+    <text x="22" y="34" font-size="13" font-weight="700" letter-spacing="2.5" fill="#3987e5">CPU</text>
+    <text x="22" y="76" font-size="38" font-weight="600" fill="#eef0f4">0 %</text>
+    <g transform="translate(22,92)"><clipPath id="cpu1"><rect width="208" height="44"/></clipPath><g clip-path="url(#cpu1)"><g><animateTransform attributeName="transform" type="translate" from="0,0" to="-60,0" dur="2.2s" repeatCount="indefinite"/><path d="M0 30 h24 l4 -10 l4 10 h28 M60 30 h24 l4 -10 l4 10 h28 M120 30 h24 l4 -10 l4 10 h28 M180 30 h24 l4 -10 l4 10 h28 M240 30 h24 l4 -10 l4 10 h28 M300 30 h24 l4 -10 l4 10 h28 M360 30 h24 l4 -10 l4 10 h28 M420 30 h24 l4 -10 l4 10 h28 M480 30 h24 l4 -10 l4 10 h28 " fill="none" stroke="#3987e5" stroke-width="2.4" stroke-linejoin="round"/></g></g><text x="0" y="62" font-size="12.5" fill="#6b717c">a light blip at each scan, every 10 to 30 s</text></g>
+    <text x="22" y="206" font-size="13" fill="#a0a6b1">between scans · ~3 % average</text>
+  </g>
+  <g transform="translate(610.0,84)">
+    <rect width="252" height="226" rx="20" fill="#10121a" stroke="#9085e9" stroke-opacity=".35"/>
+    <text x="22" y="34" font-size="13" font-weight="700" letter-spacing="2.5" fill="#9085e9">DISK</text>
+    <text x="22" y="76" font-size="38" font-weight="600" fill="#eef0f4">45 MB</text>
+    <g transform="translate(66,118)"><circle r="40" fill="none" stroke="#9085e9" stroke-opacity=".16" stroke-width="10"/><circle r="40" fill="none" stroke="#9085e9" stroke-width="10" stroke-linecap="round" transform="rotate(-90)" stroke-dasharray="0 251.3"><animate attributeName="stroke-dasharray" values="0 251.3;2.2 251.3;2.2 251.3" keyTimes="0;.25;1" dur="5s" repeatCount="indefinite"/></circle><text y="6" font-size="15" font-weight="700" text-anchor="middle" fill="#9085e9">&lt;1 %</text><text x="60" y="-6" font-size="13" fill="#a0a6b1">the rest is free</text><text x="60" y="13" font-size="13" fill="#6b717c">of the logs it reads</text></g>
+    <text x="22" y="206" font-size="13" fill="#a0a6b1">SQLite for 107k calls from 5 GB of logs</text>
+  </g>
+  <g transform="translate(882.0,84)">
+    <rect width="252" height="226" rx="20" fill="#10121a" stroke="#c98500" stroke-opacity=".35"/>
+    <text x="22" y="34" font-size="13" font-weight="700" letter-spacing="2.5" fill="#c98500">DEPENDENCIES</text>
+    <text x="22" y="76" font-size="38" font-weight="600" fill="#eef0f4">0</text>
+    <g transform="translate(66,118)"><circle r="40" fill="none" stroke="#c98500" stroke-opacity=".16" stroke-width="10"/><circle r="40" fill="none" stroke="#c98500" stroke-width="10" stroke-linecap="butt" transform="rotate(-90)" stroke-dasharray="0 251.3"><animate attributeName="stroke-dasharray" values="0 251.3;0.0 251.3;0.0 251.3" keyTimes="0;.25;1" dur="5s" repeatCount="indefinite"/></circle><text y="6" font-size="15" font-weight="700" text-anchor="middle" fill="#c98500">0</text><text x="60" y="-6" font-size="13" fill="#a0a6b1">nothing to install</text><text x="60" y="13" font-size="13" fill="#6b717c">pip installs</text></g>
+    <text x="22" y="206" font-size="13" fill="#a0a6b1">Python standard library only</text>
+  </g>
+  <text x="66" y="338" font-size="13.5" fill="#6b717c">The animation runs in your browser tab, not in the service; close the tab and Latidos only reads new log lines.</text>
+</g>
+</svg>
