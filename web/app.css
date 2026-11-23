@@ -319,6 +319,13 @@ body.refreshing .ranking { opacity: .85; }
 .cursor-models { list-style: none; margin: 4px 0 18px; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; }
 .cursor-models li span { color: var(--muted); }
 .d-cursor { font-size: 10.5px; font-weight: 650; color: var(--cursor); }
+/* Other agents (L-182): a line each with its eye, in the agent's colour (--tag). */
+.agent-lines .agent-line { display: flex; align-items: center; margin: 1px 0 0; white-space: nowrap; min-width: 0; }
+.agent-lines .agent-line b { color: var(--tag); flex: none; }
+.agent-lines .agent-line .agent-rest { margin-left: .3em; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.agent-lines .agent-line .q-eye { margin: 0 3px 0 -4px; }
+.agent-lines .agent-line.off { opacity: .6; }
+.d-agent { font-size: 10.5px; font-weight: 650; color: var(--muted); white-space: nowrap; }
 
 /* Zoom */
 .zoom-chip { position: absolute; z-index: 4; left: 50%; transform: translateX(-50%); top: 0; font-size: 13px; font-weight: 600; }

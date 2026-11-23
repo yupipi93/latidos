@@ -26,5 +26,6 @@
   "quota_headers": {},
   "timezone": "Europe/Madrid",
   "companion_id": "latidos.claude-relaunch",
+  "resume_command": "claude-{tag}-one --resume {session}",
   "settings": {"soon_days": 3, "notify_days": 2, "login_timeout_seconds": 300}
 }

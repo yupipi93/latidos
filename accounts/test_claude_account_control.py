@@ -190,3 +190,41 @@ class Control(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OpenWeb(unittest.TestCase):
+    """L-199: claude.ai in the account's Chrome profile; nothing is really opened."""
+
+    def call(self, *argv, active="mt", returncode=0):
+        seen = []
+
+        def fake_run(cmd, **kw):
+            seen.append(cmd)
+            return mock.Mock(returncode=returncode, stdout="", stderr="boom" if returncode else "")
+
+        with mock.patch.object(ctl.subprocess, "run", fake_run), \
+                mock.patch.object(cas, "current_account", return_value=active):
+            code, res = run("open-web", *argv)
+        return code, res, seen
+
+    def test_active_account_by_default(self):
+        code, res, seen = self.call()
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [["open", "-na", "Google Chrome", "--args", "--profile-directory=Profile 2", "https://claude.ai"]])
+        self.assertEqual(res, {"ok": True, "tag": "mt", "profile": "Profile 2", "url": "https://claude.ai"})
+
+    def test_named_account(self):
+        _, res, seen = self.call("na")
+        self.assertEqual(seen[0][4], "--profile-directory=Profile 3")
+        self.assertEqual(res["tag"], "na")
+
+    def test_unknown_or_profileless_account_opens_nothing(self):
+        code, res, seen = self.call("zz")
+        self.assertEqual((code, res["error"], seen), (2, "unknown_account", []))
+        with mock.patch.dict(cas.CFG.by_tag["na"].__dict__, {"chrome_profile": ""}):
+            code, res, seen = self.call("na")
+        self.assertEqual((code, res["error"], seen), (1, "no_chrome_profile", []))
+
+    def test_open_failure_is_reported(self):
+        code, res, _ = self.call(returncode=1)
+        self.assertEqual((code, res["error"]), (1, "open_failed"))

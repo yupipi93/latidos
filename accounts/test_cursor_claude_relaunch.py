@@ -1193,3 +1193,83 @@ class ConfiguredTag(unittest.TestCase):
         self.assertIn("not managed", cca.configured_tag(self.settings("/elsewhere/old/claude-cursor-wrapper.sh")))
         self.assertIn("not managed", cca.configured_tag(self.settings("/elsewhere/other-wrapper.sh")))
         self.assertIn("not managed", cca.configured_tag({cca.ENV_KEY: []}))
+
+
+class ExtensionScope(unittest.TestCase):
+    """L-198: --move-open finds Cursor's extension processes only, never VS Code's; a switch
+    writes VS Code's settings only when VS Code has the Claude extension."""
+
+    def test_pattern_is_anchored_to_cursors_extensions(self):
+        import re
+        cursor = f"{cca.CURSOR_EXTENSIONS_DIR}/anthropic.claude-code-2.1.329-darwin-arm64/resources/native-binary/claude --output-format stream-json"
+        vscode = str(Path.home() / ".vscode/extensions/anthropic.claude-code-2.1.329-darwin-arm64/resources/native-binary/claude") + " --x"
+        insiders = str(Path.home() / ".vscode-insiders/extensions/anthropic.claude-code-2.1.329/resources/native-binary/claude")
+        self.assertTrue(re.search(cca.EXTENSION_BINARY, cursor))
+        self.assertFalse(re.search(cca.EXTENSION_BINARY, vscode))
+        self.assertFalse(re.search(cca.EXTENSION_BINARY, insiders))
+        # The folder is a literal: its dots match only dots.
+        self.assertFalse(re.search(cca.EXTENSION_BINARY, cursor.replace("/.cursor/", "/xcursor/")))
+
+    def test_pattern_follows_the_configured_folder(self):
+        with mock.patch.dict(os.environ, {"CURSOR_EXTENSIONS_DIR": "/opt/cur.sor/ext/"}):
+            fspec = importlib.util.spec_from_file_location("cca_scope", SCRIPT)
+            mod = importlib.util.module_from_spec(fspec)
+            fspec.loader.exec_module(mod)
+        self.assertEqual(mod.EXTENSION_BINARY,
+                         "/opt/cur\\.sor/ext/anthropic\\.claude-code-[^/]*/resources/native-binary/claude")
+
+    def vscode_fixture(self, with_extension: bool, settings_text: str | None = None) -> tuple[Path, Path]:
+        root = Path(tempfile.mkdtemp(prefix="cca-vscode-"))
+        self.addCleanup(_shutil.rmtree, root, True)
+        ext, user = root / "extensions", root / "User"
+        ext.mkdir()
+        user.mkdir()
+        if with_extension:
+            (ext / "anthropic.claude-code-2.1.329-darwin-arm64").mkdir()
+        settings = user / "settings.json"
+        if settings_text is not None:
+            settings.write_text(settings_text)
+        return ext, settings
+
+    def switch(self, ext: Path, vsettings: Path, cursor_settings: Path) -> str:
+        buf = io.StringIO()
+        with mock.patch.object(cca, "VSCODE_EXTENSIONS", ext), mock.patch.object(cca, "VSCODE_SETTINGS", vsettings), \
+                mock.patch.object(cca, "SETTINGS", cursor_settings), mock.patch.object(cca, "live_sessions", return_value=[]), \
+                redirect_stdout(buf):
+            self.assertEqual(cca.switch("mt", quiet=False, check=False), 0)
+        return buf.getvalue()
+
+    def test_switch_writes_vscode_settings_when_the_extension_exists(self):
+        ext, vs = self.vscode_fixture(True, json.dumps({"editor.fontSize": 13}))
+        cursor = Path(tempfile.mkdtemp(prefix="cca-cursor-")) / "settings.json"
+        out = self.switch(ext, vs, cursor)
+        data = json.loads(vs.read_text())
+        self.assertEqual(data["editor.fontSize"], 13, "other settings kept")
+        self.assertEqual(data[cca.ENV_KEY], [{"name": "CLAUDE_CONFIG_DIR", "value": str(cca.ACCOUNTS["mt"]["dir"])}])
+        self.assertEqual(data[cca.WRAPPER_KEY], str(cca.WRAPPER))
+        self.assertIn("VS Code on mt", out)
+        self.assertEqual(json.loads(cursor.read_text())[cca.ENV_KEY][0]["value"], str(cca.ACCOUNTS["mt"]["dir"]))
+
+    def test_no_extension_leaves_vscode_alone(self):
+        ext, vs = self.vscode_fixture(False, "{}")
+        cursor = Path(tempfile.mkdtemp(prefix="cca-cursor-")) / "settings.json"
+        self.switch(ext, vs, cursor)
+        self.assertEqual(vs.read_text(), "{}")
+
+    def test_vscode_settings_with_comments_are_never_overwritten(self):
+        text = '{\n  // a comment\n  "a": 1\n}\n'
+        ext, vs = self.vscode_fixture(True, text)
+        cursor = Path(tempfile.mkdtemp(prefix="cca-cursor-")) / "settings.json"
+        out = self.switch(ext, vs, cursor)
+        self.assertEqual(vs.read_text(), text)
+        self.assertIn("VS Code settings not changed", out)
+        self.assertTrue(cursor.exists(), "Cursor still switched")
+
+
+class LoginHint(unittest.TestCase):
+    """Audit of 103, M3: the printed re-login command bypasses a shell function named claude,
+    which would otherwise log the active account in instead of the named one."""
+
+    def test_hint_uses_command_claude(self):
+        self.assertEqual(cca.login_hint("lt"), "(unset CLAUDE_CONFIG_DIR; command claude /login)")
+        self.assertEqual(cca.login_hint("mt"), f"CLAUDE_CONFIG_DIR={cca.ACCOUNTS['mt']['dir']} command claude /login")

@@ -76,8 +76,23 @@ SETTINGS = Path(os.environ.get("CURSOR_USER_SETTINGS",
 WRAPPER = Path(__file__).resolve().parent / "claude-cursor-wrapper.sh"
 ENV_KEY = "claudeCode.environmentVariables"
 WRAPPER_KEY = "claudeCode.claudeProcessWrapper"
-# The binary the extension bundles; T3 Code and terminals run other paths.
-EXTENSION_BINARY = "/anthropic.claude-code-[^/]*/resources/native-binary/claude"
+# The binary the extension bundles, under Cursor's extensions folder only (L-198): VS Code
+# runs the same extension from ~/.vscode/extensions, and its tabs have no relaunch
+# companion, so --move-open must never end them. T3 Code and terminals run other paths.
+CURSOR_EXTENSIONS_DIR = Path(os.environ.get("CURSOR_EXTENSIONS_DIR", HOME / ".cursor" / "extensions"))
+
+
+def _ere(text: str) -> str:
+    """`text` as a literal in a POSIX extended regex (pgrep) and in Python's re."""
+    return re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", text)
+
+
+EXTENSION_BINARY = _ere(str(CURSOR_EXTENSIONS_DIR).rstrip("/")) + "/anthropic\\.claude-code-[^/]*/resources/native-binary/claude"
+# VS Code with the same extension (not required): a switch also writes its user settings so
+# its new tabs start on the new account; its open tabs are never moved (L-198).
+VSCODE_EXTENSIONS = Path(os.environ.get("VSCODE_EXTENSIONS_DIR", HOME / ".vscode" / "extensions"))
+VSCODE_SETTINGS = Path(os.environ.get("VSCODE_USER_SETTINGS",
+                                      HOME / "Library" / "Application Support" / "Code" / "User" / "settings.json"))
 
 CFG = accounts_config.CONFIG
 ACCOUNTS = {a.tag: {"dir": a.dir, "unset": a.default, "email": a.email} for a in CFG.accounts}
@@ -108,15 +123,51 @@ def tag_for_dir(cfg: str) -> str:
     return cfg
 
 
-def load_settings() -> dict:
-    return json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
+def load_settings(path: Path | None = None) -> dict:
+    path = path or SETTINGS
+    return json.loads(path.read_text()) if path.exists() else {}
 
 
-def write_settings(data: dict) -> None:
+def write_settings(data: dict, path: Path | None = None) -> None:
     # Same-directory temp + rename: Cursor's file watcher never sees a half-written file.
-    tmp = SETTINGS.with_name(f".{SETTINGS.name}.{os.getpid()}.tmp")
+    path = path or SETTINGS
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data, indent=4, ensure_ascii=False) + "\n")
-    os.replace(tmp, SETTINGS)
+    os.replace(tmp, path)
+
+
+def with_account(settings: dict, tag: str) -> dict:
+    """The extension settings pointed at `tag`: CLAUDE_CONFIG_DIR plus the wrapper that drops
+    the default account's dir (the setting cannot say "unset")."""
+    entries = [e for e in env_entries(settings) if e["name"] != "CLAUDE_CONFIG_DIR"]
+    entries.append({"name": "CLAUDE_CONFIG_DIR", "value": str(ACCOUNTS[tag]["dir"])})
+    settings[ENV_KEY] = entries
+    settings[WRAPPER_KEY] = str(WRAPPER)
+    return settings
+
+
+def vscode_has_claude() -> bool:
+    """VS Code has the Claude extension installed and a user settings folder."""
+    return VSCODE_SETTINGS.parent.is_dir() and any(VSCODE_EXTENSIONS.glob("anthropic.claude-code-*"))
+
+
+def switch_vscode(tag: str, quiet: bool) -> int:
+    """Point VS Code's Claude extension at `tag` (new tabs only). A settings file that is not
+    plain JSON (comments) is left untouched: 1, with a note."""
+    try:
+        settings = load_settings(VSCODE_SETTINGS)
+        if not isinstance(settings, dict):
+            raise ValueError("not an object")
+    except (OSError, ValueError) as exc:
+        print(f"⚠️ VS Code settings not changed ({VSCODE_SETTINGS}: {exc}); set "
+              f"{ENV_KEY} CLAUDE_CONFIG_DIR={ACCOUNTS[tag]['dir']} by hand")
+        return 1
+    if configured_tag(settings) == tag:
+        return 0
+    write_settings(with_account(settings, tag), VSCODE_SETTINGS)
+    if not quiet:
+        print(f"✅ VS Code on {tag}: new Claude tabs use it (open ones are not moved)")
+    return 0
 
 
 def env_entries(settings: dict) -> list[dict]:
@@ -887,7 +938,9 @@ def auth_email(tag: str) -> str | None:
 
 def login_hint(tag: str) -> str:
     acc = ACCOUNTS[tag]
-    return "(unset CLAUDE_CONFIG_DIR; claude /login)" if acc["unset"] else f"CLAUDE_CONFIG_DIR={acc['dir']} claude /login"
+    # `command claude`: a shell function named claude must not pick another account (audit of 103, M3).
+    return ("(unset CLAUDE_CONFIG_DIR; command claude /login)" if acc["unset"]
+            else f"CLAUDE_CONFIG_DIR={acc['dir']} command claude /login")
 
 
 def verify(tag: str) -> int:
@@ -920,22 +973,22 @@ def status() -> int:
 
 def switch(tag: str, quiet: bool, check: bool = True) -> int:
     acc = ACCOUNTS[tag]
-    if not SETTINGS.parent.is_dir():
+    cursor, vscode = SETTINGS.parent.is_dir(), vscode_has_claude()
+    if not cursor and not vscode:
         if not quiet:
             print(f"ℹ️ Cursor is not installed ({SETTINGS.parent} missing), nothing to switch")
         return 0
     # Before the no-op shortcut: "already on mt" means nothing if mt holds the wrong login.
     if check and verify(tag):
         return 1
+    if vscode:
+        switch_vscode(tag, quiet)  # a failure there only warns: Cursor still follows
+    if not cursor:
+        return 0
     if quiet and configured_tag(load_settings()) == tag:
         return 0
 
-    settings = load_settings()
-    entries = [e for e in env_entries(settings) if e["name"] != "CLAUDE_CONFIG_DIR"]
-    entries.append({"name": "CLAUDE_CONFIG_DIR", "value": str(acc["dir"])})
-    settings[ENV_KEY] = entries
-    settings[WRAPPER_KEY] = str(WRAPPER)
-    write_settings(settings)
+    write_settings(with_account(load_settings(), tag))
 
     stale = [s for s in live_sessions() if s["tag"] != tag]
     if stale and not quiet:

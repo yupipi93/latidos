@@ -4,6 +4,7 @@
   claude-account-control.py state                # JSON: active, priority, score per account, auto switch
   claude-account-control.py activate <tag>       # switch the default like claude-<tag>, then move idle Cursor tabs
   claude-account-control.py order lt,mt,na       # save the priority the auto switch weighs
+  claude-account-control.py open-web [tag]       # claude.ai in the account's Chrome profile (default: active)
 
 `activate` does the steps of a shell switch command without a terminal (login
 check, Cursor's setting, shared pool, T3 Code, ~/.claude-active last), under the auto
@@ -16,6 +17,10 @@ a page can start it in the background and poll.
 claude-auto-switch.py on its next tick. Every known account is kept: a list that misses
 one gets it appended.
 
+`open-web` (L-199) runs `open -na "Google Chrome" --args --profile-directory=<profile>
+https://claude.ai` with the account's `chrome_profile` from the accounts config, the active
+account (~/.claude-active) when no tag is given. It changes no account and no login.
+
 Stdlib only. Prints JSON on stdout; exit 0 on success, 1 on failure, 2 on bad input.
 """
 
@@ -26,6 +31,7 @@ import fcntl
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -237,6 +243,27 @@ def order(raw: str) -> int:
     return out({"ok": True, "order": full, "env_overrides": bool(os.environ.get("CLAUDE_AUTO_SWITCH_ORDER"))})
 
 
+CLAUDE_WEB = "https://claude.ai"
+
+
+def open_web(tag: str | None = None) -> int:
+    """Open claude.ai in the Chrome profile of `tag` (default: the active account)."""
+    tag = tag or cas.current_account()
+    acc = cas.CFG.by_tag.get(tag)
+    if acc is None:
+        return out({"ok": False, "error": "unknown_account", "tag": tag}, 2)
+    if not acc.chrome_profile:
+        return out({"ok": False, "error": "no_chrome_profile", "tag": tag}, 1)
+    cmd = ["open", "-na", "Google Chrome", "--args", f"--profile-directory={acc.chrome_profile}", CLAUDE_WEB]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return out({"ok": False, "error": "open_failed", "tag": tag, "detail": str(exc)[:200]}, 1)
+    if res.returncode != 0:
+        return out({"ok": False, "error": "open_failed", "tag": tag, "detail": (res.stderr or res.stdout)[-200:]}, 1)
+    return out({"ok": True, "tag": tag, "profile": acc.chrome_profile, "url": CLAUDE_WEB})
+
+
 def main(argv: list[str]) -> int:
     if len(argv) == 1 and argv[0] == "state":
         return state()
@@ -244,6 +271,8 @@ def main(argv: list[str]) -> int:
         return activate(argv[1])
     if len(argv) == 2 and argv[0] == "order":
         return order(argv[1])
+    if 1 <= len(argv) <= 2 and argv[0] == "open-web":
+        return open_web(argv[1] if len(argv) == 2 else None)
     print(__doc__, file=sys.stderr)
     return 2
 

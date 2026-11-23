@@ -184,7 +184,8 @@ def switch(tag: str, restart: bool, quiet: bool) -> int:
 
     email = auth_email(tag)
     if email != acc["email"]:
-        login = f"CLAUDE_CONFIG_DIR={acc['home']} claude /login" if acc["home"] else "(unset CLAUDE_CONFIG_DIR; claude /login)"
+        login = (f"CLAUDE_CONFIG_DIR={acc['home']} command claude /login" if acc["home"]
+                 else "(unset CLAUDE_CONFIG_DIR; command claude /login)")
         print(f"❌ {tag} is not logged in as {acc['email']} (got {email}). Log in first: {login}")
         return 1
 

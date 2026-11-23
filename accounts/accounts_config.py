@@ -50,6 +50,25 @@ def config_path() -> Path:
     return Path(os.path.expanduser(base)) / "claude-accounts.json"
 
 
+def order_file_path() -> Path:
+    """The priority the Latidos cards save (`claude-order.json`): CLAUDE_ACCOUNTS_ORDER_FILE,
+    else next to the accounts config's default place (same rules as Latidos' config dir)."""
+    if os.environ.get("CLAUDE_ACCOUNTS_ORDER_FILE"):
+        return Path(os.path.expanduser(os.environ["CLAUDE_ACCOUNTS_ORDER_FILE"]))
+    base = os.environ.get("LATIDOS_CONFIG_DIR") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or str(HOME / ".config"), "latidos")
+    return Path(os.path.expanduser(base)) / "claude-order.json"
+
+
+def read_order_file(path: Path) -> str | None:
+    """The saved priority (`{"order": ["work", "home"]}`) as "work,home", or None."""
+    try:
+        order = json.loads(path.read_text()).get("order")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return ",".join(str(t) for t in order) if isinstance(order, list) and order else None
+
+
 class Account:
     """One Claude login: `dir` is its config folder, `env` the CLAUDE_CONFIG_DIR value to run
     it with (None for the default account, which runs with the variable unset)."""

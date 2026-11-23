@@ -19,6 +19,7 @@
     // What is shown (L-158): Cursor, and the Claude accounts not in `hidden` (tag -> true),
     // both switched from the account cards; at least one source always stays on.
     cursor: store("latidos.cursor") !== "0", hidden: hiddenFromStore(),
+    agentsOff: agentsOffFromStore(),  // other agents (L-182) switched off by their eye: id -> true
     currency: store("latidos.currency") === "USD" ? "USD" : "EUR",
     factor: 1,
     lastOk: 0, failing: false,
@@ -72,6 +73,11 @@
   // apart from Claude's cells and from each other.
   var CURSOR_HUES = [158, 176, 192, 206, 222, 240, 258, 276];
   function cursorTint(name) {
+    if (name.indexOf("agent:") === 0) {
+      // An agent's cell ("agent:<id>:<project>"): a close hue of its agent's family.
+      var id = name.split(":")[1], ha = hash(name), la = hash(name + "l") < 0.5 ? 0 : 1;
+      return hueHex(F.agentHue(id, ha), S.theme.dark ? 58 + la * 12 : 34 + la * 12);
+    }
     var base = S.theme.cursor, h = hash("cursor:" + name), l = hash(name + "l") < 0.5 ? 0 : 1;
     var hue = CURSOR_HUES[Math.floor(h * CURSOR_HUES.length) % CURSOR_HUES.length];
     return mixHex(base, hueHex(hue, S.theme.dark ? 56 + l * 14 : 30 + l * 14), 0.9);
@@ -245,10 +251,36 @@
     return out;
   }
   function hiddenTags() { return Object.keys(S.hidden).sort(); }
+  function agentsOffFromStore() {
+    var out = {};
+    try {
+      var a = JSON.parse(store("latidos.agents.off") || "[]");
+      (Array.isArray(a) ? a : []).forEach(function (t) { if (typeof t === "string" && /^[a-z0-9_-]{1,32}$/.test(t)) out[t] = true; });
+    } catch (e) {}
+    return out;
+  }
+  // Other agents (L-182): every active agent the server lists, and the ones shown.
+  function agentList(d) { return (d && d.agents) || []; }
+  function shownAgents(d) { return agentList(d).filter(function (a) { return !S.agentsOff[a.id]; }); }
+  function agentById(d, id) { var f = null; agentList(d).forEach(function (a) { if (a.id === id) f = a; }); return f; }
+  function agentTotals(d) {
+    var t = { usd: 0, tokens: 0 };
+    shownAgents(d).forEach(function (a) { t.usd += a.totals.usd || 0; t.tokens += a.totals.tokens || 0; });
+    return t;
+  }
+  function agentColor(id) { return hueHex(F.agentHue(id), S.theme.dark ? 64 : 42); }
+  function setAgentShown(id, show) {
+    if (!S.agentsOff[id] === show) return;
+    if (show) delete S.agentsOff[id]; else S.agentsOff[id] = true;
+    store("latidos.agents.off", JSON.stringify(Object.keys(S.agentsOff).sort()));
+    S.epoch++;  // a new view: one reel spin
+    if (S.data) render(true);
+  }
   // A live call is played only when its account is shown (Cursor's by its own switch).
   // By origin, as the server filters (a Bedrock or Vertex call made under a hidden
   // account's login is still shown: audit of 86).
   function shownEv(ev) {
+    if (ev.agent) return !S.agentsOff[ev.agent];
     if (ev.cursor) return S.cursor;
     var o = ev.origin || (ev.account ? "acct:" + ev.account : "");
     return !(o.indexOf("acct:") === 0 && S.hidden[o.slice(5)]);
@@ -688,7 +720,31 @@
                    share: p.usd ? t.usd / p.usd : ((p.turns + p.requests) ? (t.turns + t.requests) / (p.turns + p.requests) : 0) };
         });
       });
-      Object.keys(blobs).forEach(function (k) { if (blobs[k].cursor && !seen[k]) blobs[k].dead = true; });
+      Object.keys(blobs).forEach(function (k) { if (blobs[k].cursor && !blobs[k].agent && !seen[k]) blobs[k].dead = true; });
+      order = Object.keys(blobs).map(function (k) { return blobs[k]; });
+      rescale();
+      syncLabels();
+    }
+
+    // Other agents (L-182): cells "agent:<id>:<project>", drawn like Cursor's in the
+    // agent's own hue family; sized by cost, or by activity where the tool keeps none.
+    function syncAgents(list) {
+      var seen = {};
+      (list || []).forEach(function (a) {
+        a.projects.forEach(function (p) {
+          var key = "agent:" + a.id + ":" + p.name;
+          seen[key] = 1;
+          var b = blobs[key] || (blobs[key] = newBlob(key));
+          b.cursor = true; b.agent = a.id; b.agentName = a.name; b.unit = a.count_unit; b.p = p; b.dead = false;
+          b.moons = (p.tasks || []).slice(0, 9).map(function (t, j) {
+            var old = b.moons[j] || {};
+            return { t: t, a: old.a != null ? old.a : hash(t.key) * 6.28, d: 0.28 + 0.5 * hash(t.key + "d"),
+                     s: (0.25 + hash(t.key + "s")) * (hash(t.key + "w") > 0.5 ? 1 : -1),
+                     share: p.usd ? t.usd / p.usd : (p.requests ? t.requests / p.requests : 0) };
+          });
+        });
+      });
+      Object.keys(blobs).forEach(function (k) { if (blobs[k].agent && !seen[k]) blobs[k].dead = true; });
       order = Object.keys(blobs).map(function (k) { return blobs[k]; });
       rescale();
       syncLabels();
@@ -796,9 +852,10 @@
         var top = p.tasks && p.tasks[0];
         b.el.innerHTML = "";
         b.el.classList.toggle("cursor", !!b.cursor);
+        b.el.style.borderColor = b.agent ? agentColor(b.agent) : "";
         var name = document.createElement("b");
         var dot = document.createElement("i"); dot.className = "dot"; dot.style.background = b.cursor ? cursorTint(b.name) : cellColor(b);
-        name.appendChild(dot); name.appendChild(document.createTextNode(b.cursor ? "Cursor · " + cursorName(p) : projName(p.name)));
+        name.appendChild(dot); name.appendChild(document.createTextNode(b.cursor ? extTitle(b.agentName, p) : projName(p.name)));
         var line = document.createElement("span");
         b.lineEl = line;
         paintLine(b);
@@ -816,6 +873,11 @@
     var liveBy = {};
     function paintLine(b) {
       if (!b.lineEl || !b.p) return;
+      if (b.agent) {
+        b.lineEl.textContent = b.p.usd ? money(b.p.usd) + " · " + F.tokens(b.p.tokens)
+          : b.p.tokens ? F.tokens(b.p.tokens) + " tokens" : F.agentCount(b.p, b.unit);
+        return;
+      }
       if (b.cursor) {
         b.lineEl.textContent = b.p.usd ? money(b.p.usd) + " · " + F.tokens(b.p.tokens) : F.cursorCount(b.p);
         return;
@@ -919,7 +981,7 @@
     // edge on the desktop, its top on the phone, where the cards sit under the cells).
     // Null when the cards are not shown. The card beats as the spark leaves it.
     function sparkOrigin(ev) {
-      if (quotaEl.hidden) return null;
+      if (quotaEl.hidden || ev.agent) return null;
       var card = ev.cursor ? quotaEl.querySelector('.qcard[data-kind="cursor"]') : accountCardOf(ev.account);
       if (!card || card.hidden) return null;
       var r = rectIn(card, true), phone = window.innerWidth <= 760;
@@ -1131,7 +1193,7 @@
           var cg = ctx.createLinearGradient(b.x - b.r, b.y - b.r, b.x + b.r, b.y + b.r);
           // A deep, see-through body (what is behind shows through); the rim keeps the
           // bright Cursor colour so the cell still reads as Cursor at a glance.
-          var deep = mixHex(T.cursorDeep || col, col, 0.72);
+          var deep = b.agent ? mixHex(col, T.dark ? "#101218" : "#2a2f38", 0.45) : mixHex(T.cursorDeep || col, col, 0.72);
           cg.addColorStop(0, rgba(deep, 0.6 * a));
           cg.addColorStop(0.55, rgba(deep, 0.42 * a));
           cg.addColorStop(1, rgba(deep, 0.26 * a));
@@ -1451,7 +1513,7 @@
       if (!drag || (e && e.pointerId !== drag.id)) return;
       var d = drag; drag = null;
       canvas.style.cursor = hover ? "grab" : "default";
-      if (open && !d.moved) (d.b.cursor ? openCursorSheet : openSheet)(d.b.p);  // a tap, not a drag: the project sheet
+      if (open && !d.moved) (d.b.cursor ? openExtSheet(d.b) : openSheet(d.b.p));  // a tap, not a drag: the project sheet
       // A throw keeps its velocity (capped) and the physics settles it back.
       d.b.vx = Math.max(-40, Math.min(40, d.b.vx * 1.4));
       d.b.vy = Math.max(-40, Math.min(40, d.b.vy * 1.4));
@@ -1490,7 +1552,7 @@
       if (!drag) { pointer = { x: -1e4, y: -1e4 }; lastScreen = null; hover = null; placeLabels(true); } });
 
     return {
-      sync: sync, syncCursor: syncCursor, resize: resize, spark: spark, live: live,
+      sync: sync, syncCursor: syncCursor, syncAgents: syncAgents, resize: resize, spark: spark, live: live,
       zoomBy: function (f) { zoomAt(cam.z * f, W / 2, H / 2); },
       tick: function (dt, t) {
         if (!ctx) return;
@@ -1897,7 +1959,12 @@
     var box = $("days");
     box.textContent = "";
     var list = d.days || [];
-    if (!list.length && !(S.cursor && d.cursor && d.cursor.days.length)) return;
+    var agentDays = {};
+    shownAgents(d).forEach(function (a) {
+      a.days.forEach(function (x) { (agentDays[x.t] = agentDays[x.t] || []).push({ a: a, x: x }); });
+    });
+    var agentFirst = Object.keys(agentDays).map(Number).sort(function (p, q) { return p - q; })[0];
+    if (!list.length && !(S.cursor && d.cursor && d.cursor.days.length) && agentFirst == null) return;
     // A range with Cursor use only: no Claude days, the strip still spans Cursor's days.
     var cursorOnly = !list.length;
     var byDay = {}, max = 0, cursorDays = {};
@@ -1907,6 +1974,7 @@
     var bd = bounds();
     var first = cursorOnly ? Infinity : list[0].t;
     if (S.cursor && d.cursor && d.cursor.days.length) first = Math.min(first, d.cursor.days[0].t);
+    if (agentFirst != null) first = Math.min(first, agentFirst);
     var start = new Date(S.range === "todo" && !S.custom ? first : bd.from);
     start.setHours(0, 0, 0, 0);
     var end = new Date(Math.min(bd.to - 60001, Date.now()));
@@ -1930,7 +1998,7 @@
       var tok = document.createElement("span"); tok.className = "d-tok";
       tok.textContent = x ? F.tokens(x.tokens) : "";
       cell.title = F.date(t, { weekday: true }) + (x ? " · " + F.tokens(x.tokens) + " tokens · " + money(x.usd) + " · " + many("n.calls", x.calls)
-        : " · " + say(cursorDays[t] ? "days.cursor.only" : "days.none"));
+        : " · " + say(cursorDays[t] ? "days.cursor.only" : agentDays[t] ? "days.agents.only" : "days.none"));
       [top, bar, val, tok].forEach(function (n) { cell.appendChild(n); });
       var cd = cursorDays[t];
       if (cd) {
@@ -1939,6 +2007,24 @@
         cm.title = "Cursor: " + money(cd.usd) + " · " + many("n.requests", cd.requests) + (cd.turns ? " · " + many("n.turns", cd.turns) : "") +
           " · " + many("n.convs", cd.convs);
         cell.appendChild(cm);
+        cell.classList.remove("empty");
+      }
+      var ad = agentDays[t];
+      if (ad) {
+        // One mark for the other agents of the day, in the agent's colour when only one.
+        var am = document.createElement("span"); am.className = "d-agent";
+        var ausd = 0, areq = 0;
+        // Cost when there is one; else the requests with a short unit, or "active" for the
+        // tools that only show active days (never requests, calls and days added up).
+        ad.forEach(function (y) { ausd += y.x.usd; if (y.a.count_unit !== "days") areq += y.x.requests; });
+        am.textContent = "◆ " + (ausd >= 0.005 ? F.moneyRound(cur(ausd), S.currency)
+          : areq ? say("agent.mark.requests", { n: F.num(areq) }) : say("agent.mark.active"));
+        if (ad.length === 1) am.style.color = agentColor(ad[0].a.id);
+        am.title = ad.map(function (y) {
+          return y.a.name + ": " + (y.x.usd ? money(y.x.usd) + " · " : "") + (y.x.tokens ? F.tokens(y.x.tokens) + " tokens · " : "") +
+            F.agentCount(y.x, y.a.count_unit);
+        }).join("\n");
+        cell.appendChild(am);
         cell.classList.remove("empty");
       }
       if (day.getDate() === 1 || t === start.getTime()) {
@@ -2005,22 +2091,109 @@
     });
   }
 
+  // Other agents (L-182): a hero line each with its eye switch, one ranking of their
+  // projects and their models.
+  function renderAgents(d) {
+    var all = agentList(d), line = $("hero-agents"), wrap = $("agents-rank-wrap");
+    line.hidden = !all.length;
+    line.textContent = "";
+    all.forEach(function (a) {
+      var on = !S.agentsOff[a.id], tt = a.totals, sp = spendOf("agent:" + a.id);
+      var p = document.createElement("p"); p.className = "mix agent-line" + (on ? "" : " off");
+      p.style.setProperty("--tag", agentColor(a.id));
+      var eye = document.createElement("button"); eye.type = "button"; eye.className = "q-eye";
+      eye.dataset.agent = a.id;
+      eye.setAttribute("aria-pressed", String(on));
+      eye.title = say(on ? "agent.eye.hide" : "agent.eye.show", { agent: a.name });
+      eye.setAttribute("aria-label", eye.title);
+      eye.appendChild(eyeIcon(on));
+      eye.addEventListener("click", function () { setAgentShown(a.id, !on); });
+      p.appendChild(eye);
+      var bb = document.createElement("b"); bb.textContent = a.name; p.appendChild(bb);
+      if (!on) { p.appendChild(document.createTextNode(" · " + say("agent.hidden"))); line.appendChild(p); return; }
+      // One short line per agent (several can be active); the whole detail in its tooltip.
+      var share = sp && sp.share > 0 ? F.pct(sp.share, sp.share < 0.01 ? 1 : 0) : "";
+      var short = [money(tt.usd), tt.tokens ? F.tokens(tt.tokens) + " tokens" : F.agentCount(tt, a.count_unit), share];
+      var bits = [money(tt.usd)];
+      if (tt.tokens) bits.push(F.tokens(tt.tokens) + " tokens");
+      bits.push(F.agentCount(tt, a.count_unit), many("n.convs", tt.convs));
+      if (share) bits.push(say("agent.share", { pct: share }));
+      if (!a.has_tokens) bits.push(say("agent.no.tokens"));
+      if (tt.unpriced) bits.push(many("agent.unpriced", tt.unpriced));
+      if (a.status && a.status.skipped) bits.push(many("agent.skipped", a.status.skipped));
+      var rest = document.createElement("span"); rest.className = "agent-rest";
+      rest.textContent = "· " + short.filter(Boolean).join(" · ") + (tt.unpriced || (a.status && a.status.skipped) ? " · ⚠" : "");
+      p.appendChild(rest);
+      p.title = a.name + say("cursor.included") + ": " + bits.join(" · ");
+      line.appendChild(p);
+    });
+    var shown = shownAgents(d), rows = [];
+    shown.forEach(function (a) { a.projects.forEach(function (p) { rows.push({ a: a, p: p }); }); });
+    wrap.hidden = !rows.length;
+    if (!rows.length) return;
+    rows.sort(function (x, y) { return (y.p.usd - x.p.usd) || (y.p.requests - x.p.requests) || (y.p.last - x.p.last); });
+    var ol = $("agents-rank"), keep = focusedRow(ol); ol.textContent = "";
+    var maxT = 1;
+    rows.forEach(function (r) { maxT = Math.max(maxT, r.p.usd || 0); });
+    rows.slice(0, 20).forEach(function (r) {
+      var a = r.a, p = r.p, key = "agent:" + a.id + ":" + p.name;
+      var li = document.createElement("li"); li.tabIndex = 0; li.dataset.name = key;
+      var dot = document.createElement("span"); dot.className = "dot"; dot.style.background = cursorTint(key);
+      var name = document.createElement("span"); name.className = "name"; name.textContent = extTitle(a.name, p);
+      var val = document.createElement("span"); val.className = "val";
+      val.textContent = p.usd ? money(p.usd) : p.tokens ? F.tokens(p.tokens) + " tokens" : F.agentCount(p, a.count_unit);
+      var sub = document.createElement("span"); sub.className = "sub";
+      var s1 = document.createElement("span"); s1.textContent = (p.tokens ? F.tokens(p.tokens) + " tokens · " : "") +
+        F.agentCount(p, a.count_unit) + " · " + say("cursor.conv.short", { n: F.num(p.convs) });
+      var s2 = document.createElement("span"); s2.textContent = F.ago(p.last);
+      sub.appendChild(s1); sub.appendChild(s2);
+      var share = document.createElement("span"); share.className = "share";
+      var bar = document.createElement("i"); bar.style.width = Math.max(1, (p.usd || 0) / maxT * 100) + "%"; bar.style.background = agentColor(a.id);
+      share.appendChild(bar);
+      [dot, name, val, sub, share].forEach(function (x) { li.appendChild(x); });
+      var open = function () { openExtSheet({ p: p, agent: a.id, agentName: a.name, unit: a.count_unit }); };
+      li.addEventListener("click", open);
+      li.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
+      ol.appendChild(li);
+    });
+    refocus(ol, keep);
+    var ml = $("agents-models"); ml.textContent = "";
+    var models = [];
+    shown.forEach(function (a) { a.models.forEach(function (m) { models.push({ a: a, m: m }); }); });
+    models.sort(function (x, y) { return (y.m.usd - x.m.usd) || (y.m.requests - x.m.requests); });
+    models.slice(0, 10).forEach(function (x) {
+      var li = document.createElement("li");
+      li.textContent = x.m.model + " ";
+      var s = document.createElement("span");
+      s.textContent = x.a.name + " · " + many("n.calls", x.m.requests) + (x.m.usd ? " · " + money(x.m.usd) : "");
+      li.appendChild(s); ml.appendChild(li);
+    });
+  }
+
   // -------------------------------------------------------------------------------------
   // Project sheet: the tasks of one cell, with what is happening now. Each task shows how
   // fresh it is (a dot in the project's colour, "hace 3 min"); the dot of the task that
   // last received tokens blinks; live calls play on their task row while it is open.
   // -------------------------------------------------------------------------------------
-  var SH = { p: null, cursor: false, tasks: [], sort: store("latidos.sheetSort") === "recent" ? "recent" : "usd",
+  var SH = { p: null, cursor: false, agent: null, agentName: null, unit: null, tasks: [], sort: store("latidos.sheetSort") === "recent" ? "recent" : "usd",
              editing: null };  // "name" or a task key while a form is open: renders wait
   // The same colour as the project's cell, label and ranking row.
-  function sheetColor() { return SH.cursor ? cursorTint(SH.p.name) : projectColor(SH.p.name); }
+  function sheetColor() { return SH.cursor ? cursorTint(sheetKey()) : projectColor(SH.p.name); }
+  // The cell key of the open sheet: the colour of its cell, label and ranking row.
+  function sheetKey() { return SH.agent ? "agent:" + SH.agent + ":" + SH.p.name : SH.cursor ? "cursor:" + SH.p.name : SH.p.name; }
   // Live calls of this project that the current summary does not count yet.
   function sheetPending() {
     if (SH.cursor || !SH.p) return [];
     return hero.pending().filter(function (e) { return e.project === SH.p.name; });
   }
-  function openCursorSheet(p) { openAnySheet(p, true); }
-  function openSheet(p) { openAnySheet(p, false); }
+  function openCursorSheet(p) { SH.agent = null; openAnySheet(p, true); }
+  // A cell or ranking row of Cursor or of another agent.
+  function openExtSheet(b) {
+    if (!b.agent) return openCursorSheet(b.p);
+    SH.agent = b.agent; SH.agentName = b.agentName; SH.unit = b.unit;
+    openAnySheet(b.p, true);
+  }
+  function openSheet(p) { SH.agent = null; openAnySheet(p, false); }
   function openAnySheet(p, cursor) {
     SH.p = p; SH.cursor = cursor; endEdit();
     SH.tasks = F.liveTasks(p.tasks || [], sheetPending());
@@ -2030,7 +2203,9 @@
   // A new summary: the open sheet follows it (plus the calls it does not count yet).
   function refreshSheet(d) {
     if ($("sheet").hidden || !SH.p || !d) return;
-    var list = SH.cursor ? (d.cursor ? d.cursor.projects : []) : d.projects, np = null;
+    var ag = SH.agent ? agentById(d, SH.agent) : null;
+    var list = SH.agent ? (ag && !S.agentsOff[SH.agent] ? ag.projects : [])
+      : SH.cursor ? (d.cursor ? d.cursor.projects : []) : d.projects, np = null;
     (list || []).forEach(function (x) { if (x.name === SH.p.name) np = x; });
     // Not in the new answer (a range without it, Cursor switched off): close rather than
     // keep the old range's numbers on screen.
@@ -2049,16 +2224,19 @@
     var p = SH.p, add = sheetAdded(), now = Date.now(), col = sheetColor();
     // Renaming and moving are for Claude Code cells (Cursor's come from its own names).
     $("sheet-rename").hidden = SH.cursor || p.name === "desconocido";
-    $("sheet-eyebrow").textContent = say(SH.cursor ? "sheet.project.cursor" : "sheet.project");
-    $("sheet-title").textContent = SH.cursor ? "Cursor · " + cursorName(p) : projName(p.name);
+    $("sheet-eyebrow").textContent = SH.agent ? say("sheet.project.agent", { agent: SH.agentName })
+      : say(SH.cursor ? "sheet.project.cursor" : "sheet.project");
+    $("sheet-title").textContent = SH.cursor ? extTitle(SH.agent ? SH.agentName : null, p) : projName(p.name);
     $("sheet").style.setProperty("--c", col);
     var usd = (p.usd || 0) + add.usd, tok = (p.tokens || 0) + add.tokens;
     var so = $("sheet-origins");
     so.textContent = "";
-    var po = SH.cursor ? [{ key: "cursor", share: 1 }] : F.mainOrigins(sheetOrigins(p), 0.02, 6);
+    var po = SH.cursor ? [{ key: extKey(), share: 1 }] : F.mainOrigins(sheetOrigins(p), 0.02, 6);
     if (po.length) originChips(so, po, true);
     so.hidden = !po.length;
-    $("sheet-stats").textContent = SH.cursor
+    $("sheet-stats").textContent = SH.agent
+      ? money(usd) + " · " + F.tokens(tok) + " tokens · " + F.agentCount(p, SH.unit) + " · " + many("n.convs", p.convs || 0)
+      : SH.cursor
       ? money(usd) + " · " + F.tokens(tok) + " tokens · " + many("n.requests", p.requests || 0) +
         (p.turns ? " · " + many("cursor.local.turns", p.turns) : "") + " · " + many("n.convs", p.convs || 0)
       : money(usd) + " · " + F.tokens(tok) + " tokens · " + many("n.sessions", p.sessions || 0) +
@@ -2090,8 +2268,11 @@
   }
   // Providers get hues outside the account palette, so an account never looks like one.
   var ORIGIN_COLORS = { claude: "#8a8f99", bedrock: "#a16207", vertex: "#0e7490", other: "#7a6f62" };
+  // The sheet's origin chip: "cursor" or "agent:<id>".
+  function extKey() { return SH.agent ? "agent:" + SH.agent : "cursor"; }
   function originColor(key) {
     if (key === "cursor") return S.theme.cursor;
+    if (key.indexOf("agent:") === 0) return agentColor(key.slice(6));
     if (key.indexOf("acct:") === 0) {
       // The same colour as the account's card: its own, else its place in the list.
       var tag = key.slice(5), acc = (QA.data && QA.data.claude && QA.data.claude.accounts) || [], i = -1;
@@ -2101,6 +2282,7 @@
     return ORIGIN_COLORS[key] || ORIGIN_COLORS.other;
   }
   function originLabel(key) {
+    if (key.indexOf("agent:") === 0) { var ag = agentById(S.data, key.slice(6)); return ag ? ag.name : key.slice(6); }
     if (key.indexOf("acct:") === 0) return say("origin.claude.tag", { tag: key.slice(5) });
     return say("origin." + (ORIGIN_COLORS[key] || key === "cursor" ? key : "other"));
   }
@@ -2149,7 +2331,7 @@
     if (SH.cursor) {
       if (t.source === "cli") { var tc = document.createElement("span"); tc.className = "ticket"; tc.textContent = "CLI"; title.appendChild(tc); }
       title.appendChild(document.createTextNode(cursorTitle(t)));
-      originChips(title, [{ key: "cursor", share: 1 }], false);
+      originChips(title, [{ key: extKey(), share: 1 }], false);
     } else {
       if (t.ticket) { var tk = document.createElement("span"); tk.className = "ticket"; tk.textContent = t.ticket; title.appendChild(tk); }
       title.appendChild(document.createTextNode(F.taskTitle(t) || (t.ticket ? "" : say("sheet.untitled.session"))));
@@ -2158,10 +2340,12 @@
     }
     if (hintSr) title.appendChild(hintSr);
     var val = document.createElement("span"); val.className = "t-val";
-    val.textContent = t.usd ? money(t.usd) : (SH.cursor ? F.cursorCount(t) : money(0));
+    val.textContent = t.usd ? money(t.usd) : SH.agent ? (t.tokens ? F.tokens(t.tokens) + " tokens" : F.agentCount(t, SH.unit))
+      : (SH.cursor ? F.cursorCount(t) : money(0));
     var sub = document.createElement("span"); sub.className = "t-sub";
     var bits = SH.cursor
-      ? [t.model || say("sheet.model.unknown"), t.tokens ? F.tokens(t.tokens) + " tokens" : "", t.requests ? many("n.requests", t.requests) : ""]
+      ? [t.model || say("sheet.model.unknown"), t.tokens ? F.tokens(t.tokens) + " tokens" : "",
+         t.requests ? (SH.agent ? F.agentCount(t, SH.unit) : many("n.requests", t.requests)) : ""]
       : [F.tokens(t.tokens) + " tokens", many("n.sessions", t.sessions)];
     sub.textContent = bits.filter(Boolean).join(" · ") + " · ";
     var when = document.createElement("span"); when.className = "t-when";
@@ -2338,7 +2522,7 @@
     if ($("sheet").hidden) {
       sheetOpener = document.activeElement;
       // A list row may be rebuilt while the sheet is open: remember which list and project.
-      openerList = sheetOpener && sheetOpener.parentNode && /^(rank|cursor-rank)$/.test(sheetOpener.parentNode.id) ? sheetOpener.parentNode : null;
+      openerList = sheetOpener && sheetOpener.parentNode && /^(rank|cursor-rank|agents-rank)$/.test(sheetOpener.parentNode.id) ? sheetOpener.parentNode : null;
       openerName = openerList ? sheetOpener.dataset.name : null;
     }
     $("sheet").hidden = false;
@@ -2374,7 +2558,8 @@
     var d = S.data;
     if (!d) return;
     paintRanges(); paintStatus();
-    var cz = S.cursor && d.cursor ? d.cursor.totals : { tokens: 0, usd: 0 };
+    var cz0 = S.cursor && d.cursor ? d.cursor.totals : { tokens: 0, usd: 0 }, az = agentTotals(d);
+    var cz = { tokens: cz0.tokens + az.tokens, usd: cz0.usd + az.usd };  // Cursor plus the shown agents
     var cl = d.totals;
     // keep = not a reset: only a range change spins the reels.
     hero.set(cl.tokens + cz.tokens, cl.usd + cz.usd, d.seq_at, !resetHero);
@@ -2386,13 +2571,18 @@
       mix.appendChild(bb); mix.appendChild(document.createTextNode(" " + x[0]));
     });
     mix.appendChild(document.createTextNode(" · " + say("hero.mix.calls", { calls: many("n.calls", d.totals.calls), sessions: many("n.sessions", d.totals.sessions) })));
+    // Calls of a model no price table knows count at 0: say so (audit of 101).
+    if (d.totals.unpriced) mix.appendChild(document.createTextNode(" · " + many("agent.unpriced", d.totals.unpriced)));
     eco.sync(d.projects);
     eco.syncCursor(S.cursor && d.cursor ? d.cursor.projects : []);
+    eco.syncAgents(shownAgents(d));
     renderCursor(d);
+    renderAgents(d);
     renderAccounts();
     cursorSparks(d);
+    agentSparks(d);
     eco.live(F.byProject(hero.pending()));
-    river.set(onlyCursor() && d.cursor ? cursorRiver(d) : d);
+    river.set(withAgents(onlyCursor() && d.cursor ? cursorRiver(d) : d, d));
     renderDays(d);
     document.querySelector(".stage").classList.toggle("no-cursor", !S.cursor);
     paintRoi();
@@ -2400,6 +2590,17 @@
     refreshSheet(d);
     paintEcgText();
     document.title = "Latidos · " + money(cl.usd + cz.usd);
+  }
+
+  // The river carries the shown agents too: their bins in the river's unit.
+  function withAgents(rd, d) {
+    var shown = shownAgents(d);
+    if (!shown.length) return rd;
+    var unit = rd.range.unit;
+    var extra = shown.map(function (a) {
+      return unit === d.range.unit ? a.timeline : unit === "hour" ? a.hours : a.days;
+    });
+    return { range: rd.range, moments: rd.moments, timeline: F.mergeTimeline(rd.timeline, extra) };
   }
 
   function cursorRiver(d) {
@@ -2423,7 +2624,7 @@
 
   // Also after a theme change: the ranking rows, Cursor's list and an open sheet carry
   // inline colours computed for the old theme.
-  function drawAll() { if (S.data) { eco.relabel(); river.place(); renderRanking(S.data); renderCursor(S.data); refreshSheet(S.data); } renderAccounts(); }
+  function drawAll() { if (S.data) { eco.relabel(); river.place(); renderRanking(S.data); renderCursor(S.data); renderAgents(S.data); refreshSheet(S.data); } renderAccounts(); }
 
   // A language switch: the static copy, every chip and everything drawn from the data.
   function relabelAll() {
@@ -2438,6 +2639,8 @@
   // with no conversation on this Mac) come with a code; real names are data and stay.
   function projName(name) { return name === "desconocido" ? say("project.unknown") : name; }
   function cursorName(p) { return p.name_code ? say("cursor.name." + p.name_code) : p.name; }
+  // "Cursor · repo" or "Codex · repo": an outside cell's label and sheet title.
+  function extTitle(agentName, p) { return (agentName || "Cursor") + " · " + cursorName(p); }
   function cursorTitle(t) {
     return t.title_code ? say("cursor.title." + t.title_code) : (t.title || say("cursor.title.untitled"));
   }
@@ -2510,6 +2713,31 @@
     grown.slice(0, 8).forEach(function (g, i) {
       setTimeout(function () {
         eco.spark({ project: "cursor:" + g.name, cursor: true, tokens: g.tokens, usd: g.usd, t: Date.now() });
+        ecg.beat(g.tokens);
+      }, i * 450);
+    });
+  }
+
+  // Other agents (L-182): their files are read every minute, so a project whose cost or
+  // activity grew since the last summary of the same view sends a spark, as Cursor's do.
+  var agentPrev = null;
+  function agentSparks(d) {
+    var key = S.epoch + "|" + (S.custom ? "custom" : S.range) + "|" + Object.keys(S.agentsOff).sort().join(".");
+    if (!includesNow() || S.dataFromSnap || S.dataKey !== rangeKey()) { agentPrev = null; return; }
+    var map = {}, grown = [];
+    shownAgents(d).forEach(function (a) {
+      a.projects.forEach(function (p) {
+        var k = "agent:" + a.id + ":" + p.name, o = agentPrev && agentPrev.key === key ? agentPrev.map[k] : null;
+        map[k] = { usd: p.usd || 0, tokens: p.tokens || 0, requests: p.requests || 0 };
+        if (o && (p.usd - o.usd > 0.0005 || p.requests > o.requests)) {
+          grown.push({ project: k, agent: a.id, usd: Math.max(0, p.usd - o.usd), tokens: Math.max(0, (p.tokens || 0) - o.tokens) });
+        }
+      });
+    });
+    agentPrev = { key: key, map: map };
+    grown.slice(0, 8).forEach(function (g, i) {
+      setTimeout(function () {
+        eco.spark({ project: g.project, cursor: true, agent: g.agent, tokens: g.tokens, usd: g.usd, t: Date.now() });
         ecg.beat(g.tokens);
       }, i * 450);
     });
@@ -2688,6 +2916,12 @@
     if (!bo) return null;
     var cz = d.cursor ? d.cursor.totals.usd : d.cursor_totals ? d.cursor_totals.usd : 0;
     var all = cz, rest = 0, tags = {};
+    // Every agent counts in the shares, shown or not, as a hidden Cursor does (L-182).
+    agentList(d).forEach(function (a) { all += a.totals.usd || 0; });
+    if (key.indexOf("agent:") === 0) {
+      var ag = agentById(d, key.slice(6)), au = ag ? ag.totals.usd || 0 : 0;
+      return { usd: au, share: all > 0 ? au / all : 0 };
+    }
     claudeTags().forEach(function (t) { tags["acct:" + t] = true; });
     Object.keys(bo).forEach(function (k) { all += bo[k].usd || 0; if (!tags[k]) rest += bo[k].usd || 0; });
     var usd = key === "cursor" ? cz : key === "rest" ? rest : (bo[key] ? bo[key].usd : 0);

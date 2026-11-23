@@ -32,6 +32,8 @@ for _k in ("LATIDOS_CONFIG", "LATIDOS_BOARDS", "LATIDOS_ALIASES", "LATIDOS_HOME_
 # Variables of the old name are still read as fallbacks: none may leak in either.
 for _k in [k for k in os.environ if k.startswith("LATIDO_")]:
     os.environ.pop(_k, None)
+# Nor the other agents' files (L-182): an empty home for their readers.
+os.environ["LATIDOS_AGENTS_HOME"] = tempfile.mkdtemp(prefix="latidos-agents-")
 import latidos  # noqa: E402
 import cursor_source  # noqa: E402
 
@@ -2186,6 +2188,29 @@ class Http(unittest.TestCase):
             os.environ.pop(k, None)
         shutil.rmtree(cls.tmp)
 
+    def test_summary_is_strict_json_with_an_infinite_agent_cost(self):
+        # Audit of 105: one agent row with usd = inf must never put Infinity in the answer.
+        with self.app.lock:
+            self.app.con.execute("INSERT OR REPLACE INTO agent_calls (agent, id, ts, session, model, inp, out, cread, cwrite, usd) "
+                                 "VALUES ('cline', 'inf-row', ?, 's', 'mystery-model', 10, 1, 0, 0, ?)",
+                                 (int(time.time() * 1000) - 60000, float("inf")))
+            self.app.con.execute("UPDATE meta SET v = CAST(v AS INTEGER) + 1 WHERE k = 'data_version'")
+            self.app.con.commit()
+        try:
+            status, _ctype, _csp, body = self.req("/api/summary?range=7d")
+            self.assertEqual(status, 200)
+            self.assertNotIn(b"Infinity", body)
+            self.assertNotIn(b"NaN", body)
+
+            def no_constants(name):
+                raise ValueError("non-finite number in JSON: " + name)
+            d = json.loads(body, parse_constant=no_constants)
+            self.assertIn("cline", [a["id"] for a in d["agents"]])
+        finally:
+            with self.app.lock:
+                self.app.con.execute("DELETE FROM agent_calls WHERE id = 'inf-row'")
+                self.app.con.commit()
+
     def req(self, path, method="GET", host="127.0.0.1:7599"):
         c = http.client.HTTPConnection("127.0.0.1", 7599, timeout=5)
         c.request(method, path, headers={"Host": host})
@@ -2561,7 +2586,7 @@ class Http(unittest.TestCase):
         # no accounts source keeps Cursor shown, and an eye keeps its focus.
         self.assertIn('getJSON("/api/live?since=" + S.seq + hideParam())', js)
         self.assertIn('var o = ev.origin || (ev.account ? "acct:" + ev.account : "");', js)
-        self.assertIn("river.set(onlyCursor() && d.cursor ? cursorRiver(d) : d);", js)
+        self.assertIn("river.set(withAgents(onlyCursor() && d.cursor ? cursorRiver(d) : d, d));", js)
         self.assertIn('if (d && d.error === "no account source" && !S.cursor) setShown("cursor", true);', js)
         self.assertIn("""fa.dataset.eye ? 'button[data-eye="' + fa.dataset.eye + '"]'""", js)
         self.assertIn("includesNow() && shownEv(item.ev)) onLive(item.ev);", js)
@@ -2679,6 +2704,30 @@ class CursorSource(unittest.TestCase):
                 raise body
             return Resp(json.dumps(body).encode())
         return opener
+
+    def test_bogus_cursor_figures_are_dropped_never_stored_as_inf(self):
+        # Audit of 105: chargedCents 1e999 was stored as inf, and an inf token count raised
+        # OverflowError outside any guard, aborting the whole API page every pass.
+        cs = self.cs
+        for bad in (float("inf"), float("nan"), "1e999", -1, 1e9, "x"):
+            self.assertIsNone(cs.sane_cents(bad), repr(bad))
+        self.assertEqual(cs.sane_cents(None), 0.0)
+        self.assertEqual(cs.sane_cents("250"), 250.0)
+        for bad in (float("inf"), 10 ** 13, -5, "x"):
+            self.assertIsNone(cs.sane_tokens(bad), repr(bad))
+        self.assertEqual(cs.sane_tokens(None), 0)
+        self.assertEqual(cs.sane_tokens("12"), 12)
+        self.assertEqual(cs.legacy_cents({"a": {"costInCents": float("inf")}, "b": {"costInCents": 4}}), 4.0)
+        self._token(time.time() + 3600)
+        d0 = self.day + 3600000
+        ev = lambda i, cents, tok: {"usageEventId": "b%d" % i, "timestamp": str(d0 + i), "model": "m", "conversationId": "aaa",
+                                    "chargedCents": cents, "tokenUsage": {"inputTokens": tok, "outputTokens": 1}}
+        pages = [{"totalUsageEventsCount": 4, "usageEventsDisplay": [
+            ev(1, float("inf"), 10), ev(2, 50, float("inf")), ev(3, 25, 10), "not an event"]}]
+        api = cs.CursorApi(self.con, self.lock, self.state, opener=self._opener(pages, []))
+        self.assertEqual(api.scan(now_ms=self.day + 86400000), 1)   # only the sane event, the page goes on
+        rows = self.con.execute("SELECT id, cents, in_tok FROM cursor_events").fetchall()
+        self.assertEqual(rows, [("b3", 25.0, 10)])
 
     def test_api_pages_merge_and_never_leak_the_token(self):
         self._token(time.time() + 3600)
@@ -3508,6 +3557,831 @@ print(json.dumps({"is_error": False, "total_cost_usd": 0, "structured_output": {
                 self.assertEqual(self.mod.consolidate(types.SimpleNamespace(model="m", claude="/bin/false")), 1)
         finally:
             held.close()
+
+
+class AgentPricing(unittest.TestCase):
+    """Models that are not Claude get their own list price (L-182)."""
+
+    def test_openai_and_gemini_list_prices(self):
+        import agents as ag
+        self.assertAlmostEqual(ag.other_cost("gpt-5-codex", 1e6, 1e6, 1e6), 1.25 + 10 + 0.125)
+        self.assertAlmostEqual(ag.other_cost("gpt-5-mini", 1e6, 0, 0), 0.25)       # never priced as gpt-5
+        self.assertAlmostEqual(ag.other_cost("gpt-4.1-2025-04-14", 1e6, 0, 0), 2.0)
+        self.assertAlmostEqual(ag.other_cost("o4-mini", 0, 1e6, 0), 4.4)
+        self.assertAlmostEqual(ag.other_cost("gemini-2.5-flash", 1e6, 1e6, 0), 0.30 + 2.50)
+        self.assertAlmostEqual(ag.other_cost("gemini-3-pro-preview", 100000, 0, 0), 0.2)
+
+    def test_gemini_pro_long_context_tier(self):
+        import agents as ag
+        self.assertAlmostEqual(ag.other_cost("gemini-2.5-pro", 100000, 0, 0), 0.125)
+        self.assertAlmostEqual(ag.other_cost("gemini-2.5-pro", 300000, 0, 0), 0.75)  # 2.50 a million above 200k
+
+    def test_provider_prefixes_and_claude_ids(self):
+        import agents as ag
+        self.assertEqual(ag.other_price("openai/gpt-4o-mini")[0], "gpt-4o-mini")
+        self.assertEqual(ag.other_price("copilot/gpt-4.1")[0], "gpt-4.1")
+        self.assertEqual(ag.other_price("models/gemini-2.0-flash")[0], "gemini-2.0-flash")
+        self.assertEqual(ag.norm_model("openrouter/anthropic/claude-sonnet-4.5"), "claude-sonnet-4-5")
+        self.assertEqual(ag.norm_model("us.anthropic.claude-3-7-sonnet-20250219-v1:0"), "claude-3-7-sonnet-20250219")
+        claude = lambda m, i, o, r, w: latidos.call_cost(m, i, o, r, w, 0)
+        self.assertAlmostEqual(ag.api_cost("anthropic/claude-sonnet-4.5", 1e6, 0, 0, 0, claude), 3.0)
+        self.assertAlmostEqual(ag.api_cost("claude-3-5-haiku-20241022", 1e6, 0, 0, 0, claude), 0.8)
+
+    def test_unknown_model_is_unpriced_never_an_error(self):
+        import agents as ag
+        self.assertIsNone(ag.other_cost("my-local-llama", 1e6, 1e6, 0))
+        self.assertIsNone(ag.api_cost("my-local-llama", 1e6, 1e6, 0, 0, lambda *a: 99))
+        self.assertIsNone(ag.api_cost(None, 1, 1))
+        self.assertEqual(ag.norm_model(None), "")
+
+    def test_claude_code_calls_of_other_models(self):
+        # A Claude Code session through a proxy to GPT used to be priced as Opus.
+        self.assertAlmostEqual(latidos.call_cost("gpt-5", 1e6, 0, 0, 0, 0), 1.25)
+        self.assertEqual(latidos.call_cost("some-local-model", 1e6, 1e6, 0, 0, 0), 0.0)
+        # Claude ids keep their table, Bedrock ids reduced to their Claude name.
+        self.assertAlmostEqual(latidos.call_cost("claude-opus-5-5", 1e6, 0, 0, 0, 0), 4.0)
+        self.assertAlmostEqual(latidos.call_cost("anthropic.claude-sonnet-4-20250514-v1:0", 1e6, 0, 0, 0, 0), 3.0)
+        self.assertAlmostEqual(latidos.call_cost("<synthetic>", 0, 0, 0, 0, 0), 0.0)
+
+
+class AgentFixtures:
+    """Synthetic agent homes in each agent's real layout (L-182)."""
+
+    T = 1794470400000  # 2026-11-12
+
+    def setUp(self):
+        import agents as ag
+        self.ag = ag
+        self.home = tempfile.mkdtemp(prefix="agents-home-")
+        self.code = os.path.join(self.home, "code")
+        self.con = latidos.connect(os.path.join(self.home, "l.db"))
+        self.lock = threading.RLock()
+
+    def tearDown(self):
+        self.con.close()
+        shutil.rmtree(self.home)
+
+    def iso(self, ms):
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms / 1000)) + ".%03dZ" % (ms % 1000)
+
+    def write(self, rel, data, mode="w"):
+        p = os.path.join(self.home, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, mode) as fh:
+            fh.write(data if isinstance(data, str) else json.dumps(data))
+        return p
+
+    def hub(self, *ids, roots=None):
+        h = self.ag.AgentHub(self.con, self.lock, home=self.home, roots=roots)
+        if ids:
+            h.readers = [r for r in h.readers if r.id in ids]
+            h.progress = {r.id: h.progress[r.id] for r in h.readers}
+        return h
+
+    def calls(self, agent):
+        return [dict(zip(("id", "ts", "session", "model", "inp", "out", "cread", "cwrite", "usd"), r)) for r in self.con.execute(
+            "SELECT id, ts, session, model, inp, out, cread, cwrite, usd FROM agent_calls WHERE agent = ? ORDER BY ts, id",
+            (agent,))]
+
+    def session(self, agent, sid):
+        r = self.con.execute("SELECT title, cwd, created, updated FROM agent_sessions WHERE agent = ? AND id = ?",
+                             (agent, sid)).fetchone()
+        return dict(zip(("title", "cwd", "created", "updated"), r)) if r else None
+
+    def summary(self, h, t0=0, t1=None):
+        return self.ag.summarize_agents(self.con, self.lock, t0, t1 or self.T + 30 * 86400000, "day",
+                                        latidos.bin_start, latidos.project_of,
+                                        claude=lambda m, i, o, r, w: latidos.call_cost(m, i, o, r, w, 0),
+                                        readers=h.readers, progress=h.progress)
+
+
+
+class AgentReaders(AgentFixtures, unittest.TestCase):
+    """One reader per agent against synthetic files in each agent's real layout (L-182)."""
+
+    # -- Codex ------------------------------------------------------------------------
+    def codex_lines(self, sid, t, cwd):
+        tc = lambda total, inp, cached, out, dt_ms: json.dumps({"timestamp": self.iso(t + dt_ms), "type": "event_msg", "payload": {
+            "type": "token_count", "info": {"total_token_usage": {"total_tokens": total},
+                                            "last_token_usage": {"input_tokens": inp, "cached_input_tokens": cached,
+                                                                 "output_tokens": out, "reasoning_output_tokens": 5,
+                                                                 "total_tokens": inp + out}}}})
+        return [
+            json.dumps({"timestamp": self.iso(t), "type": "session_meta", "payload": {"id": sid, "timestamp": self.iso(t), "cwd": cwd}}),
+            json.dumps({"timestamp": self.iso(t), "type": "turn_context", "payload": {"cwd": cwd, "model": "gpt-5-codex"}}),
+            json.dumps({"timestamp": self.iso(t), "type": "response_item", "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "<environment_context>x</environment_context>"}]}}),
+            json.dumps({"timestamp": self.iso(t + 1), "type": "event_msg", "payload": {"type": "user_message", "message": "Fix the login page"}}),
+            json.dumps({"timestamp": self.iso(t + 2), "type": "event_msg", "payload": {"type": "token_count", "info": None}}),
+            tc(1100, 1000, 800, 100, 1000),
+            tc(1100, 1000, 800, 100, 1100),   # the same count emitted twice
+            tc(3300, 2000, 1500, 200, 2000),
+        ]
+
+    def test_codex_rollout_incremental(self):
+        sid = "0199a0b1-1111-7222-8333-944455556666"
+        cwd = os.path.join(latidos.CODE_DIR, "repo-x")
+        rel = os.path.join(".codex", "sessions", "2026", "11", "12", "rollout-2026-11-12T10-00-00-%s.jsonl" % sid)
+        lines = self.codex_lines(sid, self.T, cwd)
+        self.write(rel, "\n".join(lines) + "\n" + lines[-1][:20])  # a half-written last line waits
+        h = self.hub("codex")
+        self.assertEqual(h.scan(), 2)
+        c = self.calls("codex")
+        self.assertEqual([(x["inp"], x["cread"], x["out"], x["model"]) for x in c],
+                         [(200, 800, 100, "gpt-5-codex"), (500, 1500, 200, "gpt-5-codex")])
+        s = self.session("codex", sid)
+        self.assertEqual((s["title"], s["cwd"]), ("Fix the login page", cwd))
+        self.assertEqual(h.scan(), 0)  # unchanged file: not re-read
+        # The rest of the half line plus a new count: read from the offset, no double count.
+        p = os.path.join(self.home, rel)
+        with open(p, "rb") as fh:
+            data = fh.read()
+        with open(p, "wb") as fh:
+            fh.write(data[:data.rfind(b"\n") + 1])
+            fh.write(json.dumps({"timestamp": self.iso(self.T + 5000), "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"total_token_usage": {"total_tokens": 4000},
+                                                "last_token_usage": {"input_tokens": 600, "cached_input_tokens": 0,
+                                                                     "output_tokens": 100}}}}).encode() + b"\n")
+        self.assertEqual(h.scan(), 1)
+        self.assertEqual(len(self.calls("codex")), 3)
+        a = self.summary(h)[0]
+        self.assertEqual(a["id"], "codex")
+        self.assertEqual(a["projects"][0]["name"], "repo-x")
+        # gpt-5-codex: 1.25 in, 0.125 cached, 10 out (per million)
+        want = (200 * 1.25 + 800 * 0.125 + 100 * 10 + 500 * 1.25 + 1500 * 0.125 + 200 * 10 + 600 * 1.25 + 100 * 10) / 1e6
+        self.assertAlmostEqual(a["totals"]["usd"], round(want, 4), places=4)
+        self.assertEqual(a["totals"]["requests"], 3)
+
+    # -- Gemini CLI ---------------------------------------------------------------------
+    def test_gemini_session_with_hashed_project(self):
+        import hashlib
+        cwd = os.path.join(latidos.CODE_DIR, "repo-g")
+        hsh = hashlib.sha256(cwd.encode()).hexdigest()
+        self.con.execute("INSERT INTO calls (msg_id, ts, cwd) VALUES ('m', 1, ?)", (cwd,))  # a folder Claude Code knows
+        self.write(os.path.join(".gemini", "tmp", hsh, "chats", "session-2026-11-12T10-00-abc.json"), {
+            "sessionId": "g1", "projectHash": hsh, "startTime": self.iso(self.T), "lastUpdated": self.iso(self.T + 9000),
+            "messages": [
+                {"id": "u1", "timestamp": self.iso(self.T), "type": "user", "content": "Write the release notes"},
+                {"id": "a1", "timestamp": self.iso(self.T + 1000), "type": "gemini", "content": "ok", "model": "gemini-2.5-pro",
+                 "tokens": {"input": 12000, "output": 300, "cached": 10000, "thoughts": 200, "tool": 0, "total": 12500}},
+                {"id": "a2", "timestamp": self.iso(self.T + 2000), "type": "gemini", "model": "gemini-2.5-flash"},  # no tokens
+                "junk",
+            ]})
+        # A newer layout: a short folder name with the path in .project_root.
+        self.write(os.path.join(".gemini", "tmp", "repo-h", ".project_root"), os.path.join(latidos.CODE_DIR, "repo-h"))
+        self.write(os.path.join(".gemini", "tmp", "repo-h", "chats", "session-x.json"), {
+            "sessionId": "g2", "messages": [{"id": "a1", "timestamp": self.iso(self.T + 5000), "type": "gemini",
+                                             "model": "gemini-3-flash-preview", "tokens": {"input": 100, "output": 10}}]})
+        h = self.hub("gemini")
+        self.assertEqual(h.scan(), 2)
+        c = self.calls("gemini")
+        self.assertEqual((c[0]["inp"], c[0]["cread"], c[0]["out"]), (2000, 10000, 500))
+        self.assertEqual(self.session("gemini", "g1")["cwd"], cwd)
+        self.assertEqual(self.session("gemini", "g1")["title"], "Write the release notes")
+        self.assertEqual(self.session("gemini", "g2")["cwd"], os.path.join(latidos.CODE_DIR, "repo-h"))
+        a = self.summary(h)[0]
+        self.assertEqual(sorted(p["name"] for p in a["projects"]), ["repo-g", "repo-h"])
+        self.assertGreater(a["totals"]["usd"], 0)
+        self.assertEqual(a["totals"]["unpriced"], 0)
+
+    # -- Antigravity and Windsurf: activity only ---------------------------------------
+    def test_antigravity_and_windsurf_count_active_days(self):
+        conv = "5f0c7c6e-aaaa-bbbb-cccc-000000000001"
+        p = self.write(os.path.join(".gemini", "antigravity", "conversations", conv + ".pb"), b"\x08\x01".decode())
+        self.write(os.path.join(".gemini", "antigravity", "brain", conv, "task.md"), "# Migrate the build to Vite\n- [ ] step")
+        two_days_later = (self.T + 2 * 86400000) / 1000
+        os.utime(p, (two_days_later, two_days_later))
+        w = self.write(os.path.join(".codeium", "windsurf", "cascade", "c1.pb"), "x")
+        os.utime(w, (self.T / 1000, self.T / 1000))
+        h = self.hub("antigravity", "windsurf")
+        self.assertGreaterEqual(h.scan(), 2)
+        ag = self.calls("antigravity")
+        self.assertTrue(all(x["inp"] == 0 and x["out"] == 0 and x["usd"] is None for x in ag))
+        self.assertEqual(self.session("antigravity", conv)["title"], "Migrate the build to Vite")
+        out = {a["id"]: a for a in self.summary(h)}
+        self.assertEqual(out["antigravity"]["count_unit"], "days")
+        self.assertFalse(out["antigravity"]["has_tokens"])
+        self.assertEqual(out["antigravity"]["totals"]["usd"], 0)
+        self.assertEqual(out["windsurf"]["totals"]["requests"], 1)
+        self.assertEqual(out["windsurf"]["projects"][0]["name_code"], "no_folder")
+
+    # -- Copilot ------------------------------------------------------------------------
+    def test_copilot_sessions_json_and_journal(self):
+        ws = os.path.join("Library", "Application Support", "Code", "User", "workspaceStorage", "abc123")
+        folder = os.path.join(latidos.CODE_DIR, "repo-c")
+        self.write(os.path.join(ws, "workspace.json"), {"folder": "file://" + folder.replace(" ", "%20")})
+        self.write(os.path.join(ws, "chatSessions", "s1.json"), {
+            "version": 3, "sessionId": "s1", "creationDate": self.T, "lastMessageDate": self.T + 9000,
+            "requests": [
+                {"requestId": "r1", "timestamp": self.T + 1000, "modelId": "copilot/gpt-4.1", "message": {"text": "Explain this regex"}},
+                {"requestId": "r2", "timestamp": self.T + 2000, "modelId": "copilot/gpt-4.1", "message": {"text": "And this one"},
+                 "result": {"usage": {"promptTokens": 1000, "completionTokens": 100}}},
+            ]})
+        journal = [{"kind": 0, "v": {"sessionId": "s2", "creationDate": self.T, "requests": []}},
+                   {"kind": 2, "k": ["requests"], "v": [{"requestId": "q1", "timestamp": self.T + 3000, "message": {"text": "Hi"}}]},
+                   {"kind": 1, "k": ["customTitle"], "v": "Renamed chat"},
+                   {"kind": 1, "k": ["requests", 9, "x"], "v": 1}]  # a path that does not exist: ignored
+        self.write(os.path.join(ws, "chatSessions", "s2.jsonl"), "\n".join(json.dumps(j) for j in journal) + "\nnot json\n")
+        h = self.hub("copilot")
+        self.assertEqual(h.scan(), 3)
+        c = self.calls("copilot")
+        self.assertEqual([(x["model"], x["inp"]) for x in c], [("copilot/gpt-4.1", 0), ("copilot/gpt-4.1", 1000), (None, 0)])
+        self.assertEqual(self.session("copilot", "s1")["cwd"], folder)
+        self.assertEqual(self.session("copilot", "s2")["title"], "Renamed chat")
+        a = self.summary(h)[0]
+        self.assertEqual(a["count_unit"], "requests")
+        self.assertEqual(a["totals"]["requests"], 3)
+        self.assertAlmostEqual(a["totals"]["usd"], (1000 * 2.0 + 100 * 8.0) / 1e6, places=4)  # only the request with usage
+
+    # -- Cline, Roo Code, Kilo Code --------------------------------------------------------
+    def cline_task(self, editor, ext, task, cwd, cost=True):
+        base = os.path.join("Library", "Application Support", editor, "User", "globalStorage", ext, "tasks", task)
+        req = lambda ts, **kw: {"ts": ts, "type": "say", "say": "api_req_started", "text": json.dumps(kw)}
+        self.write(os.path.join(base, "ui_messages.json"), [
+            {"ts": self.T, "type": "say", "say": "task", "text": "Add dark mode to the settings page"},
+            req(self.T + 1000, tokensIn=10, tokensOut=500, cacheWrites=2000, cacheReads=0, **({"cost": 0.0123} if cost else {})),
+            req(self.T + 2000, tokensIn=5, tokensOut=100, cacheWrites=0, cacheReads=2000, **({"cost": 0.002} if cost else {})),
+            {"ts": self.T + 2500, "type": "say", "say": "api_req_started", "text": "{not json"},
+            {"ts": self.T + 2600, "type": "say", "say": "api_req_started", "text": json.dumps({"request": "pending"})},
+            {"ts": self.T + 3000, "type": "say", "say": "completion_result", "text": "done"},
+        ])
+        self.write(os.path.join(base, "api_conversation_history.json"), [
+            {"role": "user", "content": [{"type": "text", "text": "<environment_details>\n# Current Working Directory (%s) Files\n</environment_details>" % cwd}]}])
+        self.write(os.path.join(base, "task_metadata.json"), {"model_usage": [{"ts": self.T, "model_id": "claude-sonnet-4-5-20250929"}]})
+
+    def test_cline_roo_and_kilo_tasks(self):
+        cwd = os.path.join(latidos.CODE_DIR, "repo-k")
+        self.cline_task("Code", "saoudrizwan.claude-dev", "1731400000000", cwd)
+        self.cline_task("Cursor", "rooveterinaryinc.roo-cline", "roo-task-1", cwd, cost=False)
+        self.cline_task("Code", "kilocode.kilo-code", "kilo-1", cwd)
+        h = self.hub("cline", "roo", "kilo")
+        self.assertEqual(h.scan(), 6)
+        cl = self.calls("cline")
+        self.assertEqual([(x["inp"], x["out"], x["cwrite"], x["cread"], x["usd"]) for x in cl],
+                         [(10, 500, 2000, 0, 0.0123), (5, 100, 0, 2000, 0.002)])
+        self.assertEqual(cl[0]["model"], "claude-sonnet-4-5-20250929")
+        s = self.session("cline", "1731400000000")
+        self.assertEqual((s["title"], s["cwd"]), ("Add dark mode to the settings page", cwd))
+        out = {a["id"]: a for a in self.summary(h)}
+        self.assertAlmostEqual(out["cline"]["totals"]["usd"], 0.0143)             # Cline's own cost
+        self.assertEqual(out["cline"]["totals"]["tool_cost"], 2)
+        # Roo without a recorded cost: priced from tokens at Sonnet 4.5 (3 / 15 / 0.30 / 3.75).
+        want = (10 * 3 + 500 * 15 + 2000 * 3.75 + 5 * 3 + 100 * 15 + 2000 * 0.30) / 1e6
+        self.assertAlmostEqual(out["roo"]["totals"]["usd"], round(want, 4), places=4)
+        self.assertEqual(out["kilo"]["projects"][0]["name"], "repo-k")
+
+    # -- Aider --------------------------------------------------------------------------
+    def test_aider_history_files_under_the_code_folders(self):
+        repo = os.path.join(self.home, "code", "repo-a")
+        os.makedirs(os.path.join(self.home, "code", "node_modules", "pkg"))
+        self.write(os.path.join("code", "node_modules", "pkg", ".aider.chat.history.md"), "# aider chat started at 2026-11-12 10:00:00\n> Tokens: 1k sent, 1 received.\n")
+        self.write(os.path.join("code", "repo-a", ".aider.chat.history.md"), "\n".join([
+            "",
+            "# aider chat started at 2026-11-12 10:00:00",
+            "",
+            "> Aider v0.86.0",
+            "> Main model: anthropic/claude-sonnet-4-5 with diff edit format",
+            "",
+            "#### Add a health endpoint",
+            "",
+            "> Tokens: 4.4k sent, 213 received. Cost: $0.02 message, $0.02 session.",
+            "> Tokens: 15k sent, 1.1k cache write, 13k cache hit, 194 received. Cost: $0.01 message, $0.03 session.",
+            "",
+            "# aider chat started at 2026-11-13 09:00:00",
+            "> Model: gpt-4.1 with diff edit format",
+            "#### Rename the module",
+            "> Tokens: 1.5M sent, 2k received.",
+            "> Tokens: garbage",
+        ]))
+        h = self.hub("aider", roots=[os.path.join(self.home, "code")])
+        self.assertEqual(h.scan(), 4)
+        c = self.calls("aider")
+        self.assertEqual([(x["inp"], x["cwrite"], x["cread"], x["out"], x["usd"]) for x in c],
+                         [(4400, 0, 0, 213, 0.02), (900, 1100, 13000, 194, 0.01),
+                          (1500000, 0, 0, 2000, None), (0, 0, 0, 0, None)])
+        self.assertEqual(c[2]["model"], "gpt-4.1")
+        out = self.summary(h)[0]
+        self.assertEqual(out["projects"][0]["name"], latidos.project_of(repo))
+        self.assertAlmostEqual(out["totals"]["usd"], round(0.03 + (1500000 * 2.0 + 2000 * 8.0) / 1e6, 4), places=4)
+        self.assertEqual(self.session("aider", c[0]["session"])["title"], "Add a health endpoint")
+        self.assertEqual(self.session("aider", c[0]["session"])["cwd"], repo)
+
+    # -- OpenCode ------------------------------------------------------------------------
+    def test_opencode_storage(self):
+        st = os.path.join(".local", "share", "opencode", "storage")
+        cwd = os.path.join(latidos.CODE_DIR, "repo-o")
+        self.write(os.path.join(st, "session", "proj1", "ses_1.json"), {
+            "id": "ses_1", "title": "Refactor the parser", "directory": cwd, "time": {"created": self.T, "updated": self.T + 9000}})
+        self.write(os.path.join(st, "message", "ses_1", "msg_1.json"), {"id": "msg_1", "role": "user", "time": {"created": self.T}})
+        self.write(os.path.join(st, "message", "ses_1", "msg_2.json"), {
+            "id": "msg_2", "role": "assistant", "modelID": "gpt-5", "providerID": "openai", "cost": 0,
+            "tokens": {"input": 1000, "output": 100, "reasoning": 50, "cache": {"read": 4000, "write": 0}},
+            "time": {"created": self.T + 1000}})
+        self.write(os.path.join(st, "message", "ses_1", "msg_3.json"), {
+            "id": "msg_3", "role": "assistant", "modelID": "claude-sonnet-4-5", "cost": 0.05,
+            "tokens": {"input": 10, "output": 10, "cache": {"read": 0, "write": 0}}, "time": {"created": self.T + 2000}})
+        h = self.hub("opencode")
+        self.assertEqual(h.scan(), 2)
+        self.assertEqual(h.scan(), 0)
+        c = self.calls("opencode")
+        self.assertEqual((c[0]["inp"], c[0]["out"], c[0]["cread"], c[0]["usd"]), (1000, 150, 4000, None))
+        self.assertEqual(c[1]["usd"], 0.05)
+        out = self.summary(h)[0]
+        self.assertEqual(out["projects"][0]["tasks"][0]["title"], "Refactor the parser")
+        want = 0.05 + (1000 * 1.25 + 150 * 10 + 4000 * 0.125) / 1e6
+        self.assertAlmostEqual(out["totals"]["usd"], round(want, 4), places=4)
+
+    # -- shared behaviour -----------------------------------------------------------------
+    def test_absent_agents_are_inactive(self):
+        h = self.hub()
+        self.assertEqual(h.scan(), 0)
+        self.assertTrue(all(not p["available"] for p in h.progress.values()))
+        self.assertEqual(self.summary(h), [])
+
+    def test_a_malformed_file_is_skipped_and_counted(self):
+        self.write(os.path.join(".gemini", "tmp", "h1", "chats", "session-bad.json"), "{broken")
+        self.write(os.path.join(".gemini", "tmp", "h1", "chats", "session-list.json"), "[1, 2]")
+        self.write(os.path.join(".gemini", "tmp", "h1", "chats", "session-ok.json"), {"sessionId": "ok", "messages": [
+            {"id": "a", "timestamp": self.iso(self.T), "type": "gemini", "model": "gemini-2.5-flash", "tokens": {"input": 10, "output": 1}}]})
+        h = self.hub("gemini")
+        self.assertEqual(h.scan(), 1)
+        self.assertEqual(h.progress["gemini"]["skipped"], 1)
+        self.assertEqual(h.scan(), 0)  # the bad file is not retried until it changes
+        self.assertEqual(h.progress["gemini"]["skipped"], 1)
+
+    def test_unknown_model_counts_tokens_without_cost(self):
+        self.write(os.path.join(".gemini", "tmp", "h1", "chats", "session-1.json"), {"sessionId": "s", "messages": [
+            {"id": "a", "timestamp": self.iso(self.T), "type": "gemini", "model": "my-private-model", "tokens": {"input": 10, "output": 5}}]})
+        h = self.hub("gemini")
+        h.scan()
+        a = self.summary(h)[0]
+        self.assertEqual((a["totals"]["usd"], a["totals"]["tokens"], a["totals"]["unpriced"]), (0, 15, 1))
+
+    def test_summary_bins_days_and_range(self):
+        self.write(os.path.join(".gemini", "tmp", "h1", "chats", "session-1.json"), {"sessionId": "s", "messages": [
+            {"id": "a", "timestamp": self.iso(self.T + 3600000), "type": "gemini", "model": "gemini-2.5-flash", "tokens": {"input": 1000000, "output": 0}},
+            {"id": "b", "timestamp": self.iso(self.T + 86400000 + 3600000), "type": "gemini", "model": "gemini-2.5-flash", "tokens": {"input": 1000000, "output": 0}}]})
+        h = self.hub("gemini")
+        h.scan()
+        a = self.summary(h)[0]
+        self.assertEqual(len(a["days"]), 2)
+        self.assertEqual(len(a["timeline"]), 2)
+        self.assertAlmostEqual(sum(b["usd"] for b in a["timeline"]), 0.6)
+        self.assertEqual(a["models"][0]["model"], "gemini-2.5-flash")
+        # A range holding only the first call.
+        one = self.summary(h, self.T, self.T + 86400000)[0]
+        self.assertEqual(one["totals"]["requests"], 1)
+        # A range with no call keeps the agent listed (its files exist) with zero totals.
+        none = self.summary(h, 1, 2)[0]
+        self.assertEqual(none["totals"]["requests"], 0)
+
+    def test_hub_bumps_the_data_version_only_on_new_calls(self):
+        v = lambda: int(self.con.execute("SELECT v FROM meta WHERE k='data_version'").fetchone()[0])
+        p = self.write(os.path.join(".gemini", "tmp", "h1", "chats", "session-1.json"), {"sessionId": "s", "messages": [
+            {"id": "a", "timestamp": self.iso(self.T), "type": "gemini", "model": "gemini-2.5-flash", "tokens": {"input": 10, "output": 1}}]})
+        h = self.hub("gemini")
+        v0 = v()
+        h.scan()
+        self.assertEqual(v(), v0 + 1)
+        os.utime(p, (time.time() + 5, time.time() + 5))  # touched, same content
+        self.assertEqual(h.scan(), 0)
+        self.assertEqual(v(), v0 + 1)
+
+    def test_summary_endpoint_carries_agents(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            env = {"LATIDOS_ROOTS": os.path.join(tmp, "none"), "LATIDOS_DB": os.path.join(tmp, "l.db"),
+                   "LATIDOS_FX_URL": "http://127.0.0.1:9/never"}
+            with unittest.mock.patch.dict(os.environ, env):
+                app = latidos.App(latidos.config())
+            self.assertEqual(app.agents.readers[0].home, os.environ["LATIDOS_AGENTS_HOME"])
+            self.assertEqual(app.agents_summary(0, 1, "day"), [])
+            app.agents.store("codex", [{"id": "x", "ts": self.T, "session": "s", "model": "gpt-5", "inp": 1000000, "out": 0}],
+                             [{"id": "s", "cwd": None}])
+            out = app.agents_summary(0, self.T + 100, "day")
+            self.assertEqual([a["id"] for a in out], ["codex"])
+            self.assertAlmostEqual(out[0]["totals"]["usd"], 1.25)
+            app.con.close()
+        finally:
+            shutil.rmtree(tmp)
+
+
+class AgentAudit101(AgentFixtures, unittest.TestCase):
+    """Findings of the independent audit of release 101 (release 102)."""
+
+    def test_iso_ms_rejects_huge_infinite_and_old_times(self):
+        ag = self.ag
+        for bad in (1e30, float("inf"), float("nan"), 10 ** 400, "1e30", -5, 0, 1, "1990-01-01T00:00:00Z", True,
+                    time.time() * 1000 + 3 * 86400000):
+            self.assertIsNone(ag.iso_ms(bad), repr(bad)[:30])
+        self.assertEqual(ag.iso_ms(self.T), self.T)
+        self.assertEqual(ag.iso_ms(self.T / 1000), self.T)
+        self.assertEqual(ag.iso_ms(self.iso(self.T)), self.T)
+
+    def test_a_gemini_file_with_absurd_times_never_stops_the_pass(self):
+        big = "1" + "0" * 400
+        self.write(os.path.join(".gemini", "tmp", "h1", "chats", "session-a.json"),
+                   '{"sessionId": "a", "startTime": %s, "messages": [{"id": "x", "type": "gemini", "timestamp": 1e30, '
+                   '"tokens": {"input": 5, "output": 1}}, {"id": "y", "type": "gemini", "timestamp": Infinity, '
+                   '"tokens": {"input": 5}}, {"id": "z", "type": "gemini", "timestamp": %s, "tokens": {"input": 5}}]}' % (big, big))
+        w = self.write(os.path.join(".codeium", "windsurf", "cascade", "c1.pb"), "x")  # a reader after Gemini
+        os.utime(w, (self.T / 1000, self.T / 1000))
+        h = self.hub("gemini", "windsurf")
+        h.scan()
+        self.assertEqual(self.calls("gemini"), [])            # no call with a bogus time
+        self.assertTrue(self.calls("windsurf"))              # the next reader still ran
+
+    def test_any_error_in_a_file_is_skipped_and_the_next_readers_run(self):
+        class Boom(self.ag.Reader):
+            id, name = "boom", "Boom"
+
+            def files(self):
+                return [__file__]
+
+            def parse(self, path, state):
+                raise OverflowError("int too large")
+        w = self.write(os.path.join(".codeium", "windsurf", "cascade", "c1.pb"), "x")
+        os.utime(w, (self.T / 1000, self.T / 1000))
+        h = self.hub("windsurf")
+        h.readers.insert(0, Boom(self.home))
+        h.progress["boom"] = {"available": False, "files": 0, "skipped": 0, "error": None}
+        h.scan()
+        self.assertEqual(h.progress["boom"]["skipped"], 1)
+        self.assertTrue(self.calls("windsurf"))
+        h.scan()  # recorded as skipped: not retried until it changes
+        self.assertEqual(h.progress["boom"]["skipped"], 1)
+
+    def test_tick_survives_any_agents_error(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            env = {"LATIDOS_ROOTS": os.path.join(tmp, "none"), "LATIDOS_DB": os.path.join(tmp, "l.db"),
+                   "LATIDOS_FX_URL": "http://127.0.0.1:9/never", "LATIDOS_CURSOR_API": "0"}
+            with unittest.mock.patch.dict(os.environ, env):
+                app = latidos.App(latidos.config())
+            app.agents.scan = unittest.mock.Mock(side_effect=OverflowError("boom"))
+            app.cursor_due = lambda now=None: False   # never the real Cursor files
+            app.cursor_api.scan = unittest.mock.Mock()
+            with redirect_stderr(io.StringIO()) as err:
+                app.tick(time.time() + 10 ** 6)
+            self.assertIn("agents scan failed", err.getvalue())
+            app.con.close()
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_active_days_count_days_not_conversations(self):
+        day = self.T + 3600000
+        for i in range(3):  # three conversations, all on one day
+            p = self.write(os.path.join(".gemini", "antigravity", "conversations", "c%d.pb" % i), "x")
+            os.utime(p, (day / 1000 + i, day / 1000 + i))
+        p = self.write(os.path.join(".gemini", "antigravity", "conversations", "c9.pb"), "x")
+        os.utime(p, ((day + 86400000) / 1000,) * 2)  # a fourth, the next day
+        h = self.hub("antigravity")
+        h.scan()
+        # Birth times are the files' real creation (today): count only the two set days.
+        t0 = self.T
+        a = self.summary(h, t0, t0 + 2 * 86400000)[0]
+        self.assertEqual(a["totals"]["requests"], 2)
+        self.assertEqual(a["projects"][0]["requests"], 2)
+        self.assertEqual(sorted(t["requests"] for t in a["projects"][0]["tasks"]), [1, 1, 1, 1])
+        self.assertEqual([d["requests"] for d in a["days"]], [1, 1])
+        self.assertEqual([d["convs"] for d in a["days"]], [3, 1])
+
+    def test_agents_summary_is_cached(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            env = {"LATIDOS_ROOTS": os.path.join(tmp, "none"), "LATIDOS_DB": os.path.join(tmp, "l.db"),
+                   "LATIDOS_FX_URL": "http://127.0.0.1:9/never"}
+            with unittest.mock.patch.dict(os.environ, env):
+                app = latidos.App(latidos.config())
+            with unittest.mock.patch.object(latidos.agents, "summarize_agents", wraps=latidos.agents.summarize_agents) as sa:
+                a = app.agents_summary(0, self.T, "day")
+                b = app.agents_summary(0, self.T + 1000, "day")  # same minute
+                self.assertIs(a, b)
+                self.assertEqual(sa.call_count, 1)
+                app.agents_summary(0, self.T + 120000, "day")    # another range
+                self.assertEqual(sa.call_count, 2)
+            app.con.close()
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_a_budgeted_scan_resumes_where_it_stopped(self):
+        for i in range(5):
+            self.write(os.path.join(".gemini", "tmp", "h1", "chats", "session-%d.json" % i), {"sessionId": "s%d" % i, "messages": [
+                {"id": "a", "timestamp": self.iso(self.T), "type": "gemini", "model": "gemini-2.5-flash", "tokens": {"input": 10}}]})
+        h = self.hub("gemini")
+        clock = iter(range(0, 1000))
+        with unittest.mock.patch.object(self.ag.time, "monotonic", lambda: next(clock)):
+            h.scan(budget_s=2.5)          # stops after a few files
+            self.assertIsNotNone(h.resume)
+            self.assertTrue(h.due())      # the next pass comes at once
+            got = len(self.calls("gemini"))
+            self.assertTrue(0 < got < 5)
+            for _ in range(10):
+                if h.resume is None:
+                    break
+                h.scan(budget_s=2.5)
+        self.assertIsNone(h.resume)
+        self.assertEqual(len(self.calls("gemini")), 5)
+
+    def test_claude_code_unknown_models_are_counted_unpriced(self):
+        self.assertTrue(latidos.unpriced("my-proxy-model"))
+        self.assertFalse(latidos.unpriced("gpt-5"))
+        self.assertFalse(latidos.unpriced("claude-opus-5-5"))
+        self.assertFalse(latidos.unpriced("<synthetic>"))
+        arn = "arn:aws:bedrock:us-east-1:ACCOUNT:application-inference-profile/abc123xyz"
+        self.assertFalse(latidos.unpriced(arn))
+        self.assertGreater(latidos.call_cost(arn, 1e6, 0, 0, 0, 0), 0)
+        tmp = tempfile.mkdtemp()
+        try:
+            root = os.path.join(tmp, "projects", "p")
+            os.makedirs(root)
+            env = {"LATIDOS_ROOTS": os.path.join(tmp, "projects"), "LATIDOS_DB": os.path.join(tmp, "l.db"),
+                   "LATIDOS_FX_URL": "http://127.0.0.1:9/never"}
+            with open(os.path.join(root, "s1.jsonl"), "w") as fh:
+                fh.write(assistant("m1", "2026-11-12T10:00:00Z", U, model="my-proxy-model") + "\n")
+                fh.write(assistant("m2", "2026-11-12T10:01:00Z", U, model="claude-opus-5-5") + "\n")
+            with unittest.mock.patch.dict(os.environ, env):
+                app = latidos.App(latidos.config())
+                app.ingestor.scan()
+                d = app.summary(0, int(time.time() * 1000), None)
+            self.assertEqual(d["totals"]["unpriced"], 1)
+            self.assertEqual(d["totals"]["calls"], 2)
+            app.con.close()
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_catch_all_rows_respect_the_tier(self):
+        ag = self.ag
+        self.assertEqual(ag.other_price("gemini-3.1-flash")[0], "gemini-3-flash")
+        self.assertEqual(ag.other_price("gemini-3.1-pro-preview")[0], "gemini-3-pro")
+        self.assertEqual(ag.other_price("gemini-3.1-flash-lite")[0], None)   # no such row: unpriced
+        self.assertEqual(ag.other_price("gpt-5.4-mini")[0], "gpt-5-mini")
+        self.assertEqual(ag.other_price("gpt-5.4-nano")[0], "gpt-5-nano")
+        self.assertEqual(ag.other_price("gpt-5.4-pro")[0], "gpt-5-pro")
+        self.assertEqual(ag.other_price("gpt-5.4")[0], "gpt-5")
+        self.assertEqual(ag.other_price("gpt-5.1-codex-mini")[0], "gpt-5.1-codex-mini")
+        self.assertEqual(ag.other_price("gemini-2.5-flash-lite")[0], "gemini-2.5-flash-lite")
+        self.assertEqual(ag.other_price("o4-mini")[0], "o4-mini")
+        self.assertAlmostEqual(ag.other_cost("deepseek-chat", 1e6, 1e6, 1e6), 0.28 + 0.42 + 0.028)
+
+    def test_a_recorded_zero_cost_is_valued_at_list_price_everywhere(self):
+        self.assertIsNone(self.ag.recorded_cost(0))
+        self.assertIsNone(self.ag.recorded_cost("0"))
+        self.assertEqual(self.ag.recorded_cost(0.25), 0.25)
+        base = os.path.join("Library", "Application Support", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "tasks", "t0")
+        self.write(os.path.join(base, "ui_messages.json"), [
+            {"ts": self.T, "type": "say", "say": "api_req_started",
+             "text": json.dumps({"tokensIn": 1000000, "tokensOut": 0, "cost": 0, "modelId": "gpt-5"})}])
+        h = self.hub("cline")
+        h.scan()
+        self.assertIsNone(self.calls("cline")[0]["usd"])
+        self.assertAlmostEqual(self.summary(h)[0]["totals"]["usd"], 1.25)
+
+    def test_gemini_session_resolves_its_folder_once_known(self):
+        import hashlib
+        cwd = os.path.join(latidos.CODE_DIR, "repo-late")
+        hsh = hashlib.sha256(cwd.encode()).hexdigest()
+        self.write(os.path.join(".gemini", "tmp", hsh, "chats", "session-1.json"), {"sessionId": "late", "projectHash": hsh, "messages": [
+            {"id": "a", "timestamp": self.iso(self.T), "type": "gemini", "model": "gemini-2.5-flash", "tokens": {"input": 10}}]})
+        h = self.hub("gemini")
+        h.scan()
+        self.assertIsNone(self.session("gemini", "late")["cwd"])
+        h.scan()  # nothing new known: not re-read
+        self.con.execute("INSERT INTO calls (msg_id, ts, cwd) VALUES ('m', 1, ?)", (cwd,))
+        self.con.commit()
+        h._dirs = (0, [])  # the folder list is cached for 5 min
+        h.scan()
+        self.assertEqual(self.session("gemini", "late")["cwd"], cwd)
+        sig = self.con.execute("SELECT sig FROM agent_files").fetchone()[0]
+        self.assertNotIn("|dirs=", sig)  # resolved: a plain signature again
+
+
+
+class AgentAudit102(AgentFixtures, unittest.TestCase):
+    """Findings of the independent audit of release 102 (release 104)."""
+
+    def app(self, tmp):
+        env = {"LATIDOS_ROOTS": os.path.join(tmp, "none"), "LATIDOS_DB": os.path.join(tmp, "l.db"),
+               "LATIDOS_FX_URL": "http://127.0.0.1:9/never"}
+        with unittest.mock.patch.dict(os.environ, env):
+            return latidos.App(latidos.config())
+
+    def test_agents_cache_never_older_than_the_summary(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            app = self.app(tmp)
+            v = app.ingestor.version
+            with unittest.mock.patch.object(latidos.agents, "summarize_agents", side_effect=lambda *a, **k: [object()]) as sa:
+                a = app.agents_summary(0, self.T, "day", min_version=v)
+                self.assertIs(app.agents_summary(0, self.T, "day", min_version=v), a)   # same version: cached
+                self.assertEqual(sa.call_count, 1)
+                with app.lock:
+                    app.con.execute("UPDATE meta SET v = CAST(v AS INTEGER) + 1 WHERE k = 'data_version'")
+                    app.con.commit()
+                b = app.agents_summary(0, self.T, "day", min_version=v + 1)  # the summary is newer
+                self.assertIsNot(a, b)
+                self.assertEqual(sa.call_count, 2)
+                # A summary served stale (older version) still takes the newer block.
+                self.assertIs(app.agents_summary(0, self.T, "day", min_version=v), b)
+                self.assertEqual(sa.call_count, 2)
+            app.con.close()
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_days_split_right_in_half_hour_time_zones(self):
+        old = os.environ.get("TZ")
+        os.environ["TZ"] = "Asia/Kolkata"
+        time.tzset()
+        try:
+            d = dt.datetime(2026, 11, 19, 23, 50)
+            a = int(d.timestamp() * 1000)
+            h = self.hub()
+            h.store("codex", [{"id": "1", "ts": a, "session": "s", "model": "gpt-5", "inp": 10},
+                              {"id": "2", "ts": a + 20 * 60000, "session": "s", "model": "gpt-5", "inp": 10}], [])
+            out = self.ag.summarize_agents(self.con, self.lock, 0, a + 3600000, "day", latidos.bin_start,
+                                           latidos.project_of, readers=h.readers, progress=h.progress)
+            days = [x["t"] for x in out[0]["days"]]
+            self.assertEqual([dt.datetime.fromtimestamp(t / 1000).day for t in days], [19, 20])
+        finally:
+            if old is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old
+            time.tzset()
+
+    def test_aider_walks_nested_roots_to_their_own_depth(self):
+        code = os.path.join(self.home, "code")
+        deep = os.path.join("code", "projects", "g1", "g2", "g3", "repo", ".aider.chat.history.md")
+        hidden = os.path.join("code", ".ws", "repo2", ".aider.chat.history.md")
+        top = os.path.join("code", "repo0", ".aider.chat.history.md")
+        for rel in (deep, hidden, top):
+            self.write(rel, "# aider chat started at 2026-11-12 10:00:00\n")
+        os.symlink(code, os.path.join(self.home, "code-link"))
+        r = self.ag.AiderReader(self.home, roots=[code, os.path.join(code, "projects"), os.path.join(code, ".ws"),
+                                                  os.path.join(self.home, "code-link")])
+        self.assertEqual(len(r.search_roots()), 3)   # the link to code is the same folder
+        found = sorted(os.path.relpath(p, self.home) for p in r.files())
+        self.assertEqual(found, sorted([deep, hidden, top]))
+
+    def test_a_skipped_file_leaves_nothing_behind(self):
+        class Half(self.ag.Reader):
+            id, name = "half", "Half"
+
+            def files(self):
+                return [__file__]
+
+            def parse(self, path, state):
+                ts = AgentAudit102.T
+                return [{"id": "ok1", "ts": ts, "session": "s", "model": "gpt-5", "inp": 10},
+                        {"id": "bad", "ts": ts, "session": object(), "model": "gpt-5", "inp": 10}], [], {}
+        h = self.hub("gemini")
+        h.readers = [Half(self.home)]
+        h.progress = {"half": {"available": False, "files": 0, "skipped": 0, "error": None}}
+        v0 = self.con.execute("SELECT v FROM meta WHERE k='data_version'").fetchone()[0]
+        self.assertEqual(h.scan(), 0)
+        self.assertEqual(h.progress["half"]["skipped"], 1)
+        self.assertEqual(self.calls("half"), [])
+        self.assertFalse(self.con.in_transaction)
+        self.assertEqual(self.con.execute("SELECT v FROM meta WHERE k='data_version'").fetchone()[0], v0)
+
+    def test_token_counts_are_capped(self):
+        self.assertEqual(self.ag._int(10 ** 30), 0)
+        self.assertEqual(self.ag._int(float("inf")), 0)
+        self.assertEqual(self.ag._int(5000), 5000)
+
+    def test_a_model_that_is_not_text_is_stored_as_text(self):
+        h = self.hub()
+        h.store("gemini", [{"id": "m", "ts": self.T, "session": "s", "model": 5, "inp": 10}], [])
+        self.assertEqual(self.con.execute("SELECT typeof(model) FROM agent_calls").fetchone()[0], "text")
+
+    def test_a_stored_zero_cost_is_valued_at_list_price(self):
+        h = self.hub()
+        # A row written by release 101, which stored a recorded 0 as 0.
+        self.con.execute("INSERT INTO agent_calls (agent, id, ts, session, model, inp, out, cread, cwrite, usd) "
+                         "VALUES ('cline', 'x', ?, 's', 'gpt-5', 1000000, 0, 0, 0, 0)", (self.T,))
+        self.con.commit()
+        a = self.summary(h)[0]
+        self.assertAlmostEqual(a["totals"]["usd"], 1.25)
+        self.assertEqual(a["totals"]["tool_cost"], 0)
+
+    def test_a_session_only_change_moves_the_data_version(self):
+        v = lambda: int(self.con.execute("SELECT v FROM meta WHERE k='data_version'").fetchone()[0])
+        p = self.write(os.path.join(".gemini", "tmp", "h1", "chats", "session-1.json"), {"sessionId": "s", "messages": [
+            {"id": "a", "timestamp": self.iso(self.T), "type": "gemini", "model": "gemini-2.5-flash", "tokens": {"input": 10}}]})
+        h = self.hub("gemini")
+        h.scan()
+        v0 = v()
+        # Same calls, a title now: only the session changes.
+        self.write(os.path.join(".gemini", "tmp", "h1", "chats", "session-1.json"), {"sessionId": "s", "summary": "Fix the tests",
+            "messages": [{"id": "a", "timestamp": self.iso(self.T), "type": "gemini", "model": "gemini-2.5-flash", "tokens": {"input": 10}}]})
+        os.utime(p, (time.time() + 5, time.time() + 5))
+        self.assertEqual(h.scan(), 0)
+        self.assertEqual(v(), v0 + 1)
+        self.assertEqual(self.session("gemini", "s")["title"], "Fix the tests")
+        os.utime(p, (time.time() + 10, time.time() + 10))
+        h.scan()  # read again, nothing new: no move
+        self.assertEqual(v(), v0 + 1)
+
+    def test_a_budgeted_pass_always_makes_progress_and_resumes_by_path(self):
+        parsed = []
+        test = self
+
+        class Slow(self.ag.Reader):
+            id, name = "slow", "Slow"
+
+            def __init__(self, home):
+                test.ag.Reader.__init__(self, home)
+                self.dir = os.path.join(home, "slow")
+                os.makedirs(self.dir, exist_ok=True)
+                for i in range(4):
+                    open(os.path.join(self.dir, "f%d" % i), "w").write("x")
+
+            def files(self):
+                clock[0] += 10  # listing alone uses up the budget
+                return sorted(os.path.join(self.dir, f) for f in os.listdir(self.dir))
+
+            def parse(self, path, state):
+                parsed.append(os.path.basename(path))
+                return [{"id": os.path.basename(path), "ts": test.T, "session": "s", "model": "gpt-5", "inp": 1}], [], {}
+        clock = [0.0]
+        h = self.hub("gemini")
+        h.readers = [Slow(self.home)]
+        h.progress = {"slow": {"available": False, "files": 0, "skipped": 0, "error": None}}
+        with unittest.mock.patch.object(self.ag.time, "monotonic", lambda: clock[0]):
+            h.scan(budget_s=5)
+            self.assertEqual(parsed, ["f0"])           # at least one file, whatever the budget
+            self.assertEqual(h.resume, (0, os.path.join(h.readers[0].dir, "f1")))
+            open(os.path.join(h.readers[0].dir, "a_new"), "w").write("x")  # sorts before the resume point
+            for _ in range(10):
+                if h.resume is None:
+                    break
+                h.scan(budget_s=5)
+        self.assertEqual(parsed, ["f0", "f1", "f2", "f3"])  # resumed at f1, no file read twice
+        h.scan()
+        self.assertEqual(sorted(parsed), ["a_new", "f0", "f1", "f2", "f3"])  # the new one on the next full pass
+
+    def test_grok_fast_models(self):
+        self.assertEqual(self.ag.other_price("x-ai/grok-4.1-fast")[0], "grok-4.1-fast")
+        self.assertAlmostEqual(self.ag.other_cost("grok-4.1-fast", 1e6, 1e6, 0), 0.70)
+        self.assertEqual(self.ag.other_price("grok-4-fast-reasoning")[0], "grok-4-fast")
+        self.assertEqual(self.ag.other_price("grok-code-fast-1")[0], "grok-code-fast")
+        self.assertEqual(self.ag.other_price("grok-4")[0], "grok-4")
+
+
+class AgentAudit104(AgentFixtures, unittest.TestCase):
+    """Findings of the independent audit of release 104 (release 105)."""
+
+    def test_num_keeps_only_finite_sane_costs(self):
+        ag = self.ag
+        for bad in (float("inf"), float("nan"), "9" * 400, "1e999", 1e7, -1, "x", None):
+            self.assertIsNone(ag._num(bad), repr(bad)[:20])
+        self.assertEqual(ag._num("0.02"), 0.02)
+        self.assertEqual(ag._num(0), 0.0)
+
+    def test_an_infinite_aider_cost_never_reaches_the_summary(self):
+        self.write(os.path.join("code", "repo-a", ".aider.chat.history.md"),
+                   "# aider chat started at 2026-11-12 10:00:00\n> Model: gpt-4.1 with diff edit format\n"
+                   "> Tokens: 1k sent, 10 received. Cost: $%s message, $1 session.\n" % ("9" * 400))
+        self.write(os.path.join(".local", "share", "opencode", "storage", "message", "ses_1", "m.json"),
+                   '{"id": "m", "role": "assistant", "modelID": "gpt-5", "cost": 1e999, '
+                   '"tokens": {"input": 1000000, "output": 0}, "time": {"created": %d}}' % self.T)
+        h = self.hub("aider", "opencode", roots=[os.path.join(self.home, "code")])
+        h.scan()
+        self.assertEqual([r[0] for r in self.con.execute("SELECT usd FROM agent_calls")], [None, None])
+        out = {a["id"]: a for a in self.summary(h)}
+        self.assertAlmostEqual(out["opencode"]["totals"]["usd"], 1.25)            # list price instead
+        self.assertAlmostEqual(out["aider"]["totals"]["usd"], round((1000 * 2 + 10 * 8) / 1e6, 4))
+        json.dumps(list(out.values()), allow_nan=False)                         # strict JSON
+
+    def test_a_stored_infinite_cost_is_ignored(self):
+        h = self.hub()
+        self.con.execute("INSERT INTO agent_calls (agent, id, ts, session, model, inp, out, cread, cwrite, usd) "
+                         "VALUES ('cline', 'x', ?, 's', 'gpt-5', 1000000, 0, 0, 0, ?)", (self.T, float("inf")))
+        self.con.commit()
+        self.assertAlmostEqual(self.summary(h)[0]["totals"]["usd"], 1.25)
+
+    def test_json_answers_are_strict(self):
+        b = latidos.json_bytes({"a": float("inf"), "b": [1.5, float("nan")], "c": {"d": float("-inf")}, "e": "x"})
+        self.assertEqual(json.loads(b), {"a": None, "b": [1.5, None], "c": {"d": None}, "e": "x"})
+        self.assertNotIn(b"Infinity", b)
+        self.assertEqual(latidos.json_bytes({"a": 1}), b'{"a":1}')
+
+    def test_a_rolled_back_store_counts_no_session_change(self):
+        h = self.hub()
+        with self.assertRaises(AttributeError):
+            h.store("gemini", [], [{"id": "s1", "title": "A title", "cwd": "/x"}, "not a session"])
+        self.assertEqual(h.sessions_changed, 0)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM agent_sessions").fetchone()[0], 0)
+
+    def test_a_giant_aider_token_figure_keeps_the_rest_of_the_history(self):
+        tk = self.ag.AiderReader.tokens_of("%s sent, 213 received" % ("9" * 400))
+        self.assertEqual((tk["sent"], tk["received"]), (0, 213))
+        self.write(os.path.join("code", "repo-b", ".aider.chat.history.md"),
+                   "# aider chat started at 2026-11-12 10:00:00\n"
+                   "> Tokens: %s sent, 5 received.\n> Tokens: 2k sent, 50 received. Cost: $0.01 message.\n" % ("9" * 400))
+        h = self.hub("aider", roots=[os.path.join(self.home, "code")])
+        self.assertEqual(h.scan(), 2)
+        self.assertEqual(h.progress["aider"]["skipped"], 0)
 
 
 if __name__ == "__main__":

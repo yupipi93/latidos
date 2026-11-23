@@ -14,7 +14,9 @@
 - `classify.py` (smart classification) is the one part that calls a model: it sends session
   dossiers to the user's own `claude -p` and writes only `classified.json` in the user
   config; the server just reads that file. Tests use a fake CLI, never the real one.
-- Latidos only reads: Claude Code transcripts, Cursor's files (opened read-only) and
+- Latidos only reads: Claude Code transcripts, the other agents' local files (`agents.py`,
+  one reader per agent, no network; tests point them at `LATIDOS_AGENTS_HOME`), Cursor's
+  files (opened read-only) and
   Cursor's usage API with the user's own session, which is never stored, logged or
   returned. Keep it bound to 127.0.0.1 with the Host check, GET and HEAD, plus the page
   writes (POST, JSON, `X-Latidos: 1`): rename, assign and, when the user configured

@@ -393,3 +393,35 @@ test("a live call goes to its session's current row, not a ticket row merged wit
   assert.equal(rows.find(r => r.key === "s:S.1").usd, 2);
   assert.equal(rows.find(r => r.key === "T-1").usd, 5);
 });
+
+test("agents have their own hue family; a project picks a close hue of it", () => {
+  assert.equal(F.agentHue("codex"), 330);
+  assert.equal(F.agentHue("gemini", 0.5), 46);
+  assert.equal(F.agentHue("codex", 0.99), 342);
+  assert.equal(F.agentHue("cline", 0), 2);
+  assert.equal(F.agentHue("roo", 0.99), 4);           // wraps past 360
+  const h = F.agentHue("some-new-agent");
+  assert.ok(h >= 0 && h < 360);
+  assert.equal(F.agentHue("some-new-agent"), h);       // stable
+});
+
+test("agent counts name what was counted", () => {
+  assert.equal(F.agentCount({ requests: 3 }, "days"), "3 active days");
+  assert.equal(F.agentCount({ requests: 1 }, "requests"), "1 request");
+  assert.equal(F.agentCount({ requests: 2 }, "calls"), "2 calls");
+  assert.equal(F.agentCount({}, "calls"), "0 calls");
+});
+
+test("agent counts (Spanish)", inLang("es", () => {
+  assert.equal(F.agentCount({ requests: 1 }, "days"), "1 día activo");
+  assert.equal(F.agentCount({ requests: 4 }, "requests"), "4 peticiones");
+}));
+
+test("mergeTimeline adds the agents' bins to the river by start time", () => {
+  const base = [{ t: 10, usd: 1, tokens: 100, calls: 2 }, { t: 30, usd: 2, tokens: 50, calls: 1 }];
+  const out = F.mergeTimeline(base, [[{ t: 10, usd: 0.5, tokens: 10, calls: 1 }, { t: 20, usd: 1, tokens: 5, requests: 3 }], null]);
+  assert.deepEqual(out, [{ t: 10, usd: 1.5, tokens: 110, calls: 3 }, { t: 20, usd: 1, tokens: 5, calls: 3 },
+                         { t: 30, usd: 2, tokens: 50, calls: 1 }]);
+  assert.deepEqual(base[0], { t: 10, usd: 1, tokens: 100, calls: 2 });  // inputs untouched
+  assert.deepEqual(F.mergeTimeline(null, []), []);
+});

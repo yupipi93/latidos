@@ -32,6 +32,18 @@ Closed chats (no live process) are reported, not resumed: they are not "active".
 --include-closed to resume those headless with `claude -p --resume <id>` as well, on the
 default account (~/.claude-active): a closed chat has no process to tell its own account.
 
+Terminal chats (entrypoint cli) keep the account their process started with, so after a
+switch the wake-up can only tell them to continue on the spent account once it resets.
+For each one whose limit hit another account than the active one (the transcript's
+`session-owner` entry before the limit, else the live process's account; unknown: nothing
+is named), the run also names the command that continues it on the active account (L-197): `cd <cwd> && <resume_command>`, where `resume_command` in the
+accounts config takes `{tag}` and `{session}` (the session id shell-quoted; default:
+`CLAUDE_CONFIG_DIR=<dir> command claude --resume <id>`, `env -u CLAUDE_CONFIG_DIR ...` for
+the default account; `command` so a shell function named claude cannot change the account).
+The notice says to close the old terminal first. It goes in the run's notice, in --status and on a manual run's output,
+once per limit entry and again when the active account changes. The old terminal process
+is never signalled: closing it is the owner's call.
+
 Each limit entry is handled once (state keyed by its uuid, MAX_ATTEMPTS tries). The run
 ends with one notify.sh message listing what was woken up. Only processes this script
 starts are ever waited on; nothing is signalled.
@@ -59,6 +71,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -251,7 +264,8 @@ def stopped_chats(resumed: set[str] | None = None) -> list[dict]:
         try:
             if path.stat().st_mtime < cutoff:
                 continue
-            convo = conversation(tail_entries(path))
+            entries = tail_entries(path)
+            convo = conversation(entries)
         except OSError:
             continue
         last = last_turn(convo)
@@ -270,6 +284,7 @@ def stopped_chats(resumed: set[str] | None = None) -> list[dict]:
             "limit_at": limit_at,
             "reset_at": parse_reset(text, limit_at),
             "limit_text": text.strip(),
+            "limit_account": limit_account(entries, last.get("uuid")),
             "cwd": first_cwd(path) or last.get("cwd"),
             "entrypoint": last.get("entrypoint"),
         })
@@ -319,6 +334,77 @@ def default_account() -> str:
     except OSError:
         return CFG.default_tag
     return tag if tag in ACCOUNTS else CFG.default_tag
+
+
+def resume_command(tag: str, session: str, cwd: str | None) -> str:
+    """The shell command that continues a chat on `tag` (L-197)."""
+    acc = CFG.by_tag.get(tag)
+    fmt = str(CFG.raw.get("resume_command") or "")
+    cmd = ""
+    if fmt:
+        try:
+            cmd = fmt.format(tag=tag, session=shlex.quote(session))
+        except (KeyError, IndexError, ValueError):
+            cmd = ""  # a broken template: the generic form below
+    if not cmd:
+        # `command claude`: a shell function named claude (one that follows the active
+        # file) must not override the account set here (audit of 103, M3).
+        sid = shlex.quote(session)
+        cmd = (f"CLAUDE_CONFIG_DIR={shlex.quote(str(acc.dir))} command claude --resume {sid}" if acc and acc.env
+               else f"env -u CLAUDE_CONFIG_DIR claude --resume {sid}")
+    return f"cd {shlex.quote(cwd)} && {cmd}" if cwd else cmd
+
+
+def account_uuids() -> dict[str, str]:
+    """accountUuid -> tag, from each account's own `.claude.json` (no secret is read)."""
+    out = {}
+    for a in CFG.accounts:
+        path = (HOME / ".claude.json") if a.default else (a.dir / ".claude.json")
+        try:
+            uuid = (json.loads(path.read_text()).get("oauthAccount") or {}).get("accountUuid")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if uuid:
+            out[str(uuid)] = a.tag
+    return out
+
+
+def limit_account(entries: list[dict], limit_uuid: str | None) -> str | None:
+    """The account the limit hit: the last `session-owner` entry before the limit entry
+    (Claude Code writes one with the account running the session), mapped to its tag."""
+    owner = None
+    for e in entries:
+        if e.get("uuid") == limit_uuid and limit_uuid:
+            break
+        if e.get("type") == "session-owner" and e.get("accountUuid"):
+            owner = str(e["accountUuid"])
+    return account_uuids().get(owner) if owner else None
+
+
+def terminal_hints(chats: list[dict], live: dict[str, dict], state: dict, record: bool) -> list[str]:
+    """Resume commands for the terminal chats cut while another account is active: once per
+    limit entry and active account. Named only when the chat's live process runs on another
+    account than the active one, or (no live process) the active account changed after the
+    limit, so a chat is never pointed back at the account it ran out on (audit of 103).
+    The decision is made against the account the limit hit (the transcript's session owner,
+    else the live process's account); unknown: nothing is named (audit of 106).
+    With `record`, the state remembers what was named."""
+    active = default_account()
+    out = []
+    for chat in chats:
+        if chat.get("entrypoint") != "cli":
+            continue
+        proc = live.get(chat["session"])
+        hit = chat.get("limit_account") or (proc or {}).get("account")
+        if not hit or hit == active:
+            continue
+        rec = state.get(chat["limit_uuid"], {})
+        if rec.get("status") == "done" or rec.get("hint") == active:
+            continue
+        out.append(resume_command(active, chat["session"], chat.get("cwd")))
+        if record:
+            state.setdefault(chat["limit_uuid"], {"session": chat["session"]})["hint"] = active
+    return out
 
 
 def quota_open(tag: str) -> tuple[bool, str]:
@@ -426,6 +512,19 @@ def tick(dry_run: bool, ignore_reset: bool, include_closed: bool) -> int:
     state = load_state()
     chats = stopped_chats(headless_sessions(state))
     live = live_processes()
+    hints = terminal_hints(chats, live, state, record=not dry_run)
+    if hints:
+        if sys.stdin.isatty():
+            print("terminal chats cut by the limit: close the old terminal first, then continue on the active account with:")
+            print("\n".join(f"  {h}" for h in hints))
+        if dry_run:
+            log(f"[dry-run] would name {len(hints)} terminal resume command(s)")
+        else:
+            save_state(state)
+            log(f"named {len(hints)} terminal resume command(s)")
+            notify("Chat de terminal cortado por el límite",
+                   f"Cierra antes el terminal viejo y sigue en la cuenta {default_account()} con:\n"
+                   + "\n".join(hints), "warn")
     due: dict[str, list[dict]] = {}
     closed: list[dict] = []
     skipped: list[str] = []
@@ -615,6 +714,9 @@ def status() -> int:
                  else "closed")
         print(f"- {c['session'][:8]}  limit {c['limit_at']:%d/%m %H:%M}  reset {c['reset_at']:%d/%m %H:%M}  "
               f"{where}  state {rec.get('status', 'pending')} ({rec.get('attempts', 0)} tries)")
+        if c.get("entrypoint") == "cli":
+            print(f"    terminal chat, continue on {default_account()}: "
+                  f"{resume_command(default_account(), c['session'], c.get('cwd'))}")
     if LOG.exists():
         print("last log lines:")
         print("".join(LOG.read_text().splitlines(keepends=True)[-6:]), end="")

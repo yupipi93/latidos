@@ -254,18 +254,20 @@ class BypassDisabled(unittest.TestCase):
         mt = self.account(remote={"channelsEnabled": True})
         seen = []
 
-        def fake_run(cmd, **kw):
-            seen.append((kw["env"].get("CLAUDE_CONFIG_DIR"), cmd[1:]))
+        def fake_run(cmd, stdin, env, stream):
+            seen.append((env.get("CLAUDE_CONFIG_DIR"), cmd[1:]))
             out = b"usage limit reached" if len(seen) == 1 else b"ok"
-            return mock.Mock(returncode=1 if len(seen) == 1 else 0, stdout=out, stderr=b"")
+            return cwf.Attempt(1 if len(seen) == 1 else 0, out, b"")
 
         argv = ["x", "-p", "go", "--permission-mode", "bypassPermissions"]
         with mock.patch.dict(cwf.ACCOUNTS, {"lt": {"name": "L", "config_dir": None},
                                             "mt": {"name": "M", "config_dir": str(mt)}}), \
-                mock.patch.object(cwf, "HOME", home), mock.patch.object(cwf, "ORDER", ["lt", "mt"]), \
+                mock.patch.object(cwf, "HOME", home), mock.patch.object(cwf, "effective_order", lambda: ["lt", "mt"]), \
+                mock.patch.object(cwf, "active_account", lambda: None), \
                 mock.patch.object(cwf, "STATE", self.root / "fb-state.json"), \
                 mock.patch.object(cwf, "LOG", self.root / "fb.log"), mock.patch.object(cwf, "notify"), \
-                mock.patch.object(cwf.subprocess, "run", fake_run), mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(cwf, "run_child", fake_run), mock.patch.object(cwf, "REAL", "/nonexistent/claude"), \
+                mock.patch.object(cwf, "install_signal_handlers"), mock.patch.object(sys, "argv", argv), \
                 mock.patch.object(sys, "stdin", None), mock.patch.object(sys, "stdout", mock.Mock()), \
                 mock.patch.object(sys, "stderr", mock.Mock()):
             cwf.main()
@@ -692,6 +694,84 @@ class QuotaResumeTick(unittest.TestCase):
              mock.patch.object(cqr, "resume_headless", side_effect=lambda c, tag, t: resumed.append(tag) or (True, "x")):
             cqr.tick(dry_run=False, ignore_reset=False, include_closed=True)
         self.assertEqual(resumed, ["mt"])
+
+    def hint_tick(self, chats, live, state, active="na"):
+        notes = []
+        with mock.patch.object(cqr, "stopped_chats", return_value=chats), \
+             mock.patch.object(cqr, "live_processes", return_value=live), \
+             mock.patch.object(cqr, "load_state", return_value=state), \
+             mock.patch.object(cqr, "save_state"), mock.patch.object(cqr, "log"), \
+             mock.patch.object(cqr, "default_account", return_value=active), \
+             mock.patch.object(cqr, "notify", side_effect=lambda *a: notes.append(a)), \
+             mock.patch.object(cqr, "quota_open", return_value=(False, "limit")), \
+             mock.patch.object(cqr.os, "kill") as kill, redirect_stdout(io.StringIO()):
+            cqr.tick(dry_run=False, ignore_reset=False, include_closed=False)
+        kill.assert_not_called()
+        return notes
+
+    def test_cut_terminal_chat_gets_its_resume_command_once(self):
+        # L-197: a terminal chat keeps its account; name the command for the active one.
+        chat = {**self.chat("t1"), "entrypoint": "cli", "cwd": "/w/repo x",
+                "reset_at": cqr.now() + cqr.dt.timedelta(hours=2), "limit_account": "lt"}
+        live = {"t1": {"pid": 9, "account": "lt", "socket": "/s/9", "name": "T", "status": "idle"}}
+        state = {}
+        notes = self.hint_tick([chat], live, state)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("cd '/w/repo x' && CLAUDE_CONFIG_DIR=", notes[0][1])
+        self.assertIn(".claude.na command claude --resume t1", notes[0][1])
+        self.assertIn("Cierra antes el terminal viejo", notes[0][1])
+        self.assertEqual(state["u-t1"]["hint"], "na")
+        self.assertEqual(self.hint_tick([chat], live, state), [], "named once per active account")
+        notes = self.hint_tick([chat], live, state, active="mt")
+        self.assertIn(".claude.mt command claude --resume t1", notes[0][1], "named again after another switch")
+
+    def test_terminal_on_the_active_account_and_cursor_tabs_get_no_command(self):
+        later = cqr.now() + cqr.dt.timedelta(hours=2)
+        on_active = {**self.chat("t2"), "entrypoint": "cli", "reset_at": later}
+        tab = {**self.chat("c2"), "reset_at": later}
+        live = {"t2": {"pid": 9, "account": "na", "socket": "/s/9", "name": "T", "status": "idle"},
+                "c2": {"pid": 8, "account": "lt", "socket": "/s/8", "name": "C", "status": "idle"}}
+        self.assertEqual(self.hint_tick([on_active, tab], live, {}), [])
+
+    def test_resume_command_forms(self):
+        self.assertEqual(cqr.resume_command("lt", "abc", None), "env -u CLAUDE_CONFIG_DIR claude --resume abc")
+        with mock.patch.dict(cqr.CFG.raw, {"resume_command": "claude-{tag}-one --resume {session}"}):
+            self.assertEqual(cqr.resume_command("mt", "abc", "/w"), "cd /w && claude-mt-one --resume abc")
+        with mock.patch.dict(cqr.CFG.raw, {"resume_command": "broken {nope}"}):
+            self.assertIn("command claude --resume abc", cqr.resume_command("mt", "abc", None))
+        # Audit of 103 (minor 2): the session id is quoted in every form.
+        evil = "x; rm -rf ~"
+        self.assertIn("--resume 'x; rm -rf ~'", cqr.resume_command("lt", evil, None))
+        self.assertIn("--resume 'x; rm -rf ~'", cqr.resume_command("mt", evil, None))
+        with mock.patch.dict(cqr.CFG.raw, {"resume_command": "claude-{tag}-one --resume {session}"}):
+            self.assertEqual(cqr.resume_command("mt", evil, None), "claude-mt-one --resume 'x; rm -rf ~'")
+
+    def test_hint_follows_the_account_the_limit_hit(self):
+        # Audit of 106: decided by the account the limit hit, never by the active file's mtime.
+        later = cqr.now() + cqr.dt.timedelta(hours=2)
+        on_na = {**self.chat("t3"), "entrypoint": "cli", "reset_at": later, "limit_account": "na"}
+        on_lt = {**self.chat("t4"), "entrypoint": "cli", "reset_at": later, "limit_account": "lt"}
+        unknown = {**self.chat("t5"), "entrypoint": "cli", "reset_at": later, "limit_account": None}
+        notes = self.hint_tick([on_na, on_lt, unknown], {}, {}, active="na")
+        self.assertEqual(len(notes), 1)
+        self.assertIn("--resume t4", notes[0][1], "only the chat cut on another account")
+        self.assertNotIn("t5", notes[0][1], "unknown account: nothing named")
+
+    def test_limit_account_reads_the_session_owner(self):
+        rows = [{"type": "session-owner", "accountUuid": "U-MT"}, {"type": "user", "uuid": "a"},
+                {"type": "session-owner", "accountUuid": "U-NA"}, {"type": "assistant", "uuid": "L"},
+                {"type": "session-owner", "accountUuid": "U-LT"}]
+        with mock.patch.object(cqr, "account_uuids", return_value={"U-MT": "mt", "U-NA": "na", "U-LT": "lt"}):
+            self.assertEqual(cqr.limit_account(rows, "L"), "na", "the owner before the limit, not after")
+            self.assertIsNone(cqr.limit_account([{"type": "user", "uuid": "L"}], "L"))
+        home = Path(tempfile.mkdtemp(prefix="cqr-home-"))
+        (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "U-LT"}}))
+        (home / ".claude.mt").mkdir()
+        (home / ".claude.mt" / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "U-MT"}}))
+        accs = [mock.Mock(tag="lt", default=True, dir=home / ".claude"), mock.Mock(tag="mt", default=False, dir=home / ".claude.mt"),
+                mock.Mock(tag="na", default=False, dir=home / ".claude.na")]
+        with mock.patch.object(cqr, "HOME", home), mock.patch.object(cqr.CFG, "accounts", accs):
+            self.assertEqual(cqr.account_uuids(), {"U-LT": "lt", "U-MT": "mt"})
 
     def test_headless_resumed_chat_hitting_the_limit_again_is_seen(self):
         # Audit of release 24: the claude -p resume writes entrypoint sdk-cli.

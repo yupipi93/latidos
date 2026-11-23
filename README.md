@@ -55,7 +55,7 @@
     </td>
     <td width="33%" valign="top">
       <h3>🔒 Nothing leaves</h3>
-      Python standard library, bound to <code>127.0.0.1</code>. It only reads your logs; the daily exchange rate and Cursor's own usage API are the only calls out.
+      Python standard library, bound to <code>127.0.0.1</code>. It only reads your agents' local files; the daily exchange rate and Cursor's own usage API are the only calls out.
     </td>
   </tr>
 </table>
@@ -66,18 +66,30 @@
 |:-:|---|---|---|
 | ✅ | **Claude Code** | ![Supported](https://img.shields.io/badge/supported-199e70?style=flat-square) | Every call in its transcripts (`~/.claude*/projects`): tokens per cache tier, model, project, branch, session title, account. Direct API, Bedrock and Vertex model ids |
 | ✅ | **Cursor** | ![Supported](https://img.shields.io/badge/supported-199e70?style=flat-square) | Its local files (conversations, titles, projects) and its own usage API: per-request tokens and the cost Cursor charges |
-| 🚧 | **OpenAI Codex CLI** | ![Work in progress](https://img.shields.io/badge/work%20in%20progress-c98500?style=flat-square) | Planned |
-| 🚧 | **Gemini CLI** | ![Work in progress](https://img.shields.io/badge/work%20in%20progress-c98500?style=flat-square) | Planned |
-| 🚧 | **Google Antigravity** | ![Work in progress](https://img.shields.io/badge/work%20in%20progress-c98500?style=flat-square) | Planned |
-| 🚧 | **GitHub Copilot** | ![Work in progress](https://img.shields.io/badge/work%20in%20progress-c98500?style=flat-square) | Planned |
-| 🚧 | **Windsurf** | ![Work in progress](https://img.shields.io/badge/work%20in%20progress-c98500?style=flat-square) | Planned |
-| 🚧 | **Cline / Roo Code** | ![Work in progress](https://img.shields.io/badge/work%20in%20progress-c98500?style=flat-square) | Planned |
-| 🚧 | **Aider** | ![Work in progress](https://img.shields.io/badge/work%20in%20progress-c98500?style=flat-square) | Planned |
-| 🚧 | **OpenCode** | ![Work in progress](https://img.shields.io/badge/work%20in%20progress-c98500?style=flat-square) | Planned |
+| ✅ | **OpenAI Codex CLI** | ![Supported](https://img.shields.io/badge/supported-199e70?style=flat-square) | Its rollout files (`~/.codex/sessions`, `$CODEX_HOME`): tokens per call (cached input apart), model, folder, first prompt. Priced at OpenAI list prices. Checked on fixtures only |
+| ✅ | **Gemini CLI** | ![Supported](https://img.shields.io/badge/supported-199e70?style=flat-square) | Its session files (`~/.gemini/tmp/*/chats`): tokens per reply (cached and thinking apart), model, folder (the hashed project folder matched against folders Latidos knows). Priced at Google list prices, with the 200k tier. Checked on fixtures only |
+| ✅ | **Google Antigravity** | ![Supported](https://img.shields.io/badge/supported-199e70?style=flat-square) | Its conversation files (`~/.gemini/antigravity/conversations`, titles from `brain/`). They are opaque protobuf with no token counts, so it shows active days, no cost. Checked on fixtures only |
+| ✅ | **GitHub Copilot** | ![Supported](https://img.shields.io/badge/supported-199e70?style=flat-square) | Copilot Chat sessions in VS Code (`workspaceStorage/*/chatSessions`, JSON and the newer journal): requests, model, workspace folder. No token data on disk in most versions: requests, no cost, unless a session records usage. Checked on fixtures only |
+| ✅ | **Windsurf** | ![Supported](https://img.shields.io/badge/supported-199e70?style=flat-square) | Its Cascade conversation files (`~/.codeium/windsurf/cascade`): opaque protobuf, active days only, no cost. Checked on fixtures only |
+| ✅ | **Cline / Roo Code** | ![Supported](https://img.shields.io/badge/supported-199e70?style=flat-square) | Their task folders in any VS Code family editor (`globalStorage/<extension>/tasks`; Kilo Code too): tokens per request with cache tiers and the cost the extension computed, model, folder, task title. Checked on fixtures only |
+| ✅ | **Aider** | ![Supported](https://img.shields.io/badge/supported-199e70?style=flat-square) | `.aider.chat.history.md` in the repositories under your code folders: tokens and the cost Aider printed per message, model, first prompt (calls placed a second apart from the session start). Checked on fixtures only |
+| ✅ | **OpenCode** | ![Supported](https://img.shields.io/badge/supported-199e70?style=flat-square) | Its storage (`~/.local/share/opencode/storage`): tokens per message with cache tiers, the cost OpenCode recorded, model, session title and folder. Checked on fixtures only |
 
 Sessions of every supported agent land in the same cells, river and counter: one picture of
-everything your agents spend. The next agents come one at a time, each with its own reader
-of the files that agent keeps on disk.
+everything your agents spend. Each agent other than Claude Code and Cursor is an origin of its
+own: cells in its own hue family, a line under the counter with an eye to hide it (remembered
+in the browser), marks on the day strip, a ranking and a project sheet. Each one has a small
+reader in `agents.py` for the files it keeps on disk; an agent whose files are not on the
+machine stays out of sight. Cost is the one the tool recorded when it records a positive
+figure; a recorded 0 (a subscription or free tier) and tools that record none use the
+model's API list price, like Claude Code's calls (OpenAI, Gemini, DeepSeek, Grok, Mistral, Qwen, Kimi, GLM and Claude
+ids; a catch-all row never prices a cheaper tier such as mini or flash at the full rate);
+a model with no known price keeps its tokens and shows as unpriced, never a guess, and the
+same counter appears under the hero for Claude Code calls of an unknown model. Antigravity
+and Windsurf count distinct active days. The first scan of a large history is spread over
+several passes of at most 5 s each.
+"Checked on fixtures only" means the reader follows the tool's documented layout and is
+tested on synthetic files, not yet on a real machine's history.
 
 ## Light on your machine
 
@@ -456,7 +468,8 @@ Binds 127.0.0.1; any Host other than `127.0.0.1:<port>`, `localhost:<port>`, `[:
 or the bound loopback address itself (`LATIDOS_HOST=::1` answers `[::1]:<port>`) gets 421;
 GET and HEAD, plus the page writes above (POST, JSON, `X-Latidos: 1`); static files
 from a whitelist; CSP `script-src 'self'` with no inline script or style. It only reads the
-session logs and never sends them anywhere. The only programs it runs are the optional
+session logs and the other agents' local files (`agents.py`, no network) and never sends
+them anywhere. The only programs it runs are the optional
 `account_control` and `account_logins_tool` commands, with the verbs above and a tag the
 command itself reported (`status` of the logins tool also on its own, every minute while
 the page is open).

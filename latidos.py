@@ -15,6 +15,7 @@ Standard library only; Python 3.9+.
 
 import bisect
 
+import agents
 import cursor_source
 import datetime as dt
 import errno
@@ -1018,6 +1019,12 @@ PRICES = [
     ("claude-mythos-5-1", (10.0, 50.0, 0.25, 12.5, 20.0)),
     ("claude-fable-5", (10.0, 50.0, 1.0, 12.5, 20.0)),
     ("claude-mythos-5", (10.0, 50.0, 1.0, 12.5, 20.0)),
+    # Older ids other agents still name (Cline, Aider, OpenCode through a provider).
+    ("claude-3-7-sonnet", (3.0, 15.0, 0.30, 3.75, 6.0)),
+    ("claude-3-5-sonnet", (3.0, 15.0, 0.30, 3.75, 6.0)),
+    ("claude-3-5-haiku", (0.80, 4.0, 0.08, 1.0, 1.6)),
+    ("claude-3-opus", (15.0, 75.0, 1.50, 18.75, 30.0)),
+    ("claude-3-haiku", (0.25, 1.25, 0.03, 0.30, 0.50)),
 ]
 # Haiku 5.5 above 100K prompt tokens.
 HAIKU_55_LONG = (0.50, 2.50, 0.05, 0.625, 1.0)
@@ -1038,7 +1045,29 @@ def price_row(model):
     return "claude-opus-5-5", dict(PRICES)["claude-opus-5-5"]
 
 
+def bedrock_profile(model):
+    """A Bedrock application inference profile ARN, which carries an id, not a model name."""
+    return "application-inference-profile" in (model or "").lower()
+
+
+def unpriced(model):
+    """True for a model call_cost prices at 0 because no table knows it (audit of 101)."""
+    return bool(model) and not model.startswith("<") and not agents.is_claude(model) \
+        and not bedrock_profile(model) and agents.other_price(model)[0] is None
+
+
 def call_cost(model, inp, out, cread, cw5, cw1h, fast=False):
+    """API cost of one call. Claude ids use the table above (a Bedrock or OpenRouter id is
+    reduced to its Claude name first); other vendors' models (a Claude Code session pointed
+    at GPT or Gemini through a proxy) use their own list price, and a model that is
+    neither known nor Claude costs 0 instead of being priced as Opus (counted as unpriced
+    by the summary). A Bedrock application inference profile ARN names no model: it is a
+    Claude call priced by the family fallback."""
+    if model and not model.startswith("<") and not agents.is_claude(model) and not bedrock_profile(model):
+        other = agents.other_cost(model, inp, out, cread, cw5 + cw1h)
+        return other if other is not None else 0.0
+    if model and agents.is_claude(model):
+        model = agents.norm_model(model) or model
     key, row = price_row(model)
     if key == "claude-haiku-5-5" and (inp + cread + cw5 + cw1h) > 100000:
         row = HAIKU_55_LONG
@@ -2459,7 +2488,8 @@ def summarize(con, lock, cfg, t0, t1, unit=None, blocks=None, on_locked=None, hi
     all_rows = rows  # the plans' figures (accounts) stay whole whatever is hidden
     if hide:
         rows = [r for r in rows if r["origin"] not in hide]
-    totals = {"tokens": 0, "inp": 0, "out": 0, "cread": 0, "cwrite": 0, "usd": 0.0, "calls": 0}
+    totals = {"tokens": 0, "inp": 0, "out": 0, "cread": 0, "cwrite": 0, "usd": 0.0, "calls": 0, "unpriced": 0}
+    unpriced_memo = {}
     sessions = {}
     models = {}
     span = (t1 - t0) if t0 > 0 else ((rows[-1]["ts_last"] - rows[0]["ts"]) if rows else 86400000)
@@ -2474,6 +2504,11 @@ def summarize(con, lock, cfg, t0, t1, unit=None, blocks=None, on_locked=None, hi
         totals["cwrite"] += r["cw5"] + r["cw1h"]
         totals["usd"] += r["usd"]
         totals["calls"] += r["n"]
+        m = r["model"]
+        if m not in unpriced_memo:
+            unpriced_memo[m] = unpriced(m)
+        if unpriced_memo[m]:
+            totals["unpriced"] += r["n"]  # calls of a model with no known price (cost 0)
         sid = r["session_id"] or "?"
         # A classified session counts once per segment (a "piece"); others once.
         entry = classified.get(sid)
@@ -2790,6 +2825,7 @@ class App:
     CURSOR_SCAN_S = 300
     CURSOR_RETRIES = 3     # failed reads of the same files retried at most this many times
     CURSOR_API_S = 600
+    AGENTS_SCAN_BUDGET_S = 5
     # The standard ranges are kept warm only while a page asked for data recently;
     # otherwise a request computes its range on demand (and wakes the warm-up).
     VIEWER_WINDOW_S = 300
@@ -2806,6 +2842,12 @@ class App:
         self.cursor = cursor_source.CursorIngestor(self.con, self.lock, project_of)
         ALIAS_LISTENERS.append(self._aliases_changed)
         self.cursor_api = cursor_source.CursorApi(self.con, self.lock)
+        # Other coding agents (L-182): read-only readers of their local files.
+        # Aider's history files are looked for under the code folders (never in a test or
+        # demo home, LATIDOS_AGENTS_HOME, which must not read the real tree).
+        roots = [CODE_DIR, PROJECTS_DIR] + WORKSPACE_DIRS if agents.agents_home() == HOME else []
+        self.agents = agents.AgentHub(self.con, self.lock, roots=roots)
+        self.agents_cache = {}
         self._cursor_at = 0
         self._cursor_sig = None
         self._cursor_fails = 0
@@ -2864,6 +2906,13 @@ class App:
         if now - self._cursor_api_at >= self.CURSOR_API_S:
             self._cursor_api_at = now
             self.cursor_api.scan()
+        if self.agents.due(now):
+            try:
+                # A budget per pass: a large first scan spreads over several passes instead
+                # of holding up the log scans (audit of 101).
+                self.agents.scan(now, budget_s=self.AGENTS_SCAN_BUDGET_S)
+            except Exception as exc:  # noqa: BLE001 - never stops the loop
+                sys.stderr.write("latidos: agents scan failed (%s)\n" % exc.__class__.__name__)
         if not self.viewer_active(now):
             return False
         now_ms = int(now * 1000)
@@ -2928,10 +2977,35 @@ class App:
             self.cache[key] = (seen["version"], now, data)
         return data
 
+    AGENTS_MAX_AGE_MS = 120000
+
+    def agents_summary(self, t0, t1, unit, min_version=None):
+        """Cached by (start minute, end minute, unit), at most 2 min old (audit of 101). An
+        entry is served only when it was computed at a data version at least `min_version`,
+        the version of the summary it goes out with (the current version when not given):
+        the page remembers that version and reloads only when it moves, so an older agents
+        block would stay on screen (audit of 102)."""
+        now = time.time() * 1000
+        version = self.ingestor.version
+        need = version if min_version is None else min_version
+        key = (t0 // 60000, t1 // 60000, unit, NAMES_GEN[0])
+        hit = self.agents_cache.get(key)
+        if hit and now - hit[0] < self.AGENTS_MAX_AGE_MS and hit[2] >= need:
+            return hit[1]
+        data = agents.summarize_agents(
+            self.con, self.lock, t0, t1, unit, bin_start, project_of, rename=alias,
+            claude=lambda m, i, o, r, w: call_cost(m, i, o, r, w, 0),
+            readers=self.agents.readers, progress=self.agents.progress)
+        if len(self.agents_cache) > 32:
+            self.agents_cache.clear()
+        self.agents_cache[key] = (now, data, version)
+        return data
+
     def _aliases_changed(self):
         """Renamed projects must show at once: drop cached summaries and move the data
         version so open pages reload."""
         self.cache.clear()
+        self.agents_cache.clear()
         with self.lock:
             self.con.execute("UPDATE meta SET v = CAST(v AS INTEGER) + 1 WHERE k = 'data_version'")
             self.con.commit()
@@ -2946,6 +3020,26 @@ class App:
         return out
 
 
+def finite(obj):
+    """obj with every non-finite float (inf, nan) replaced by None."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [finite(v) for v in obj]
+    return obj
+
+
+def json_bytes(obj):
+    """Strict JSON: Infinity or NaN would make the page's JSON.parse fail and blank it, so
+    one bad row is sent as null instead (audit of 104)."""
+    try:
+        return json.dumps(obj, separators=(",", ":"), allow_nan=False).encode()
+    except ValueError:
+        return json.dumps(finite(obj), separators=(",", ":"), allow_nan=False).encode()
+
+
 def make_handler(app):
     class Handler(BaseHTTPRequestHandler):
         server_version = "latidos/1"
@@ -2955,7 +3049,7 @@ def make_handler(app):
 
         def _send(self, code, body, ctype="application/json", cache="no-store"):
             if isinstance(body, (dict, list)):
-                body = json.dumps(body, separators=(",", ":")).encode()
+                body = json_bytes(body)
             elif isinstance(body, str):
                 body = body.encode()
             self.send_response(code)
@@ -3086,6 +3180,10 @@ def make_handler(app):
                     else:
                         # Hidden Cursor still counts in every card's share (L-159).
                         data = dict(data, cursor_totals={"usd": cz["totals"]["usd"], "tokens": cz["totals"]["tokens"]})
+                    # Other agents: cached per range at no older version than this summary's
+                    # (App.agents_summary); the page shows or hides each.
+                    data = dict(data, agents=app.agents_summary(t0, t1, data["range"]["unit"],
+                                                                min_version=data.get("version")))
                     return self._send(200, data)
                 if path == "/api/accounts":
                     return self._send(200, dict(app.home.get(),
@@ -3316,6 +3414,10 @@ def main(argv=None):
         t = time.time()
         n = app.ingestor.scan()
         print("ingested %d records in %.1fs into %s" % (n, time.time() - t, cfg["db"]))
+        t = time.time()
+        n = app.agents.scan()
+        found = ", ".join("%s %d files" % (k, v["files"]) for k, v in app.agents.progress.items() if v["available"])
+        print("agents: %d calls in %.1fs (%s)" % (n, time.time() - t, found or "none found"))
         return 0
     if argv and argv[0] == "summary":
         app = App(cfg)

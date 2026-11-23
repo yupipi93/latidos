@@ -59,6 +59,7 @@
       <p class="mix q-roi" id="q-roi" hidden></p>
       <p class="mix" id="hero-mix"></p>
       <p class="mix cursor-line" id="hero-cursor" hidden></p>
+      <div class="agent-lines" id="hero-agents" hidden></div>
       <div class="ecg">
         <canvas id="ecg" aria-hidden="true"></canvas>
         <p class="ecg-text" id="ecg-text">–</p>
@@ -100,6 +101,11 @@
       <div class="rank-head"><p class="eyebrow" data-i18n="rank.cursor.title">Cursor by project</p><p class="hint" data-i18n="rank.cursor.hint">cost and tokens from your Cursor usage history; titles and projects from this Mac</p></div>
       <ol id="cursor-rank" class="rank"></ol>
       <ul id="cursor-models" class="cursor-models"></ul>
+    </div>
+    <div class="cursor-rank" id="agents-rank-wrap" hidden>
+      <div class="rank-head"><p class="eyebrow" data-i18n="rank.agents.title">Other agents by project</p><p class="hint" data-i18n="rank.agents.hint">read from the files each agent keeps on this machine; cost as the tool recorded it, else at API prices</p></div>
+      <ol id="agents-rank" class="rank"></ol>
+      <ul id="agents-models" class="cursor-models"></ul>
     </div>
     <div class="models">
       <p class="eyebrow" data-i18n="models.title">Models</p>

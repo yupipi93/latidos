@@ -343,6 +343,44 @@
     return out;
   }
 
+  // Other agents (L-182): each has a hue family of its own, apart from Cursor's cool range
+  // where it can be; a project picks one of five close hues of its agent (h in [0, 1)).
+  var AGENT_HUES = { codex: 330, gemini: 46, antigravity: 92, copilot: 292, windsurf: 172, cline: 14,
+                     roo: 352, kilo: 62, aider: 122, opencode: 30 };
+  function agentHue(id, h) {
+    var base = AGENT_HUES[id];
+    if (base == null) {
+      base = 0;
+      for (var i = 0; i < String(id).length; i++) base = (base * 31 + String(id).charCodeAt(i)) % 360;
+    }
+    if (h == null) return base;
+    var off = [-12, -6, 0, 6, 12][Math.min(4, Math.floor(Math.max(0, h) * 5))];
+    return (base + off + 360) % 360;
+  }
+
+  // What an agent item counts when it has no cost: active days (tools whose files keep no
+  // tokens), requests (Copilot) or calls.
+  function agentCount(x, unit) {
+    var n = (x && x.requests) || 0;
+    return count(unit === "days" ? "n.active.days" : unit === "requests" ? "n.requests" : "n.calls", n);
+  }
+
+  // The river with the shown agents added: bins summed by start time, kept in order.
+  function mergeTimeline(base, extras) {
+    var by = {}, out = [];
+    function add(x) {
+      if (!x || typeof x.t !== "number") return;
+      var b = by[x.t];
+      if (!b) { b = by[x.t] = { t: x.t, usd: 0, tokens: 0, calls: 0 }; out.push(b); }
+      b.usd += x.usd || 0;
+      b.tokens += x.tokens || 0;
+      b.calls += x.calls != null ? x.calls : (x.requests || 0) + (x.turns || 0);
+    }
+    (base || []).forEach(add);
+    (extras || []).forEach(function (list) { (list || []).forEach(add); });
+    return out.sort(function (p, q) { return p.t - q.t; });
+  }
+
   // A range change spins the drums like a slot machine: wheel j (from the right) owes
   // 1 + floor(j / 3) whole turns, paid off over a fixed time (0.6 s plus 0.1 s per place,
   // at most 1.5 s, easing out), so every wheel has landed within 1.5 s. Returns the steps
@@ -353,7 +391,7 @@
   }
 
   var api = { setLang: I.setLang, lang: I.getLang, t: I.t, count: count, groupSep: groupSep, month: month,
-              moneyRound: moneyRound, spinLeft: spinLeft, untilText: untilText, cursorGrowth: cursorGrowth, wheelStep: wheelStep, taskTitle: taskTitle, liveTasks: liveTasks, sortTasks: sortTasks, latestTask: latestTask, freshness: freshness, staleness: staleness, addOrigin: addOrigin, mainOrigins: mainOrigins, afterglow: afterglow, AFTERGLOW_MS: AFTERGLOW_MS, cursorCount: cursorCount, pace: pace, byProject: byProject, liveBubble: liveBubble, rewindSeq: rewindSeq, addExtra: addExtra, startSeq: startSeq, bootChanged: bootChanged, num: num, tokens: tokens, money: money, pct: pct, date: date, hour: hour,
+              moneyRound: moneyRound, spinLeft: spinLeft, untilText: untilText, cursorGrowth: cursorGrowth, agentHue: agentHue, agentCount: agentCount, mergeTimeline: mergeTimeline, AGENT_HUES: AGENT_HUES, wheelStep: wheelStep, taskTitle: taskTitle, liveTasks: liveTasks, sortTasks: sortTasks, latestTask: latestTask, freshness: freshness, staleness: staleness, addOrigin: addOrigin, mainOrigins: mainOrigins, afterglow: afterglow, AFTERGLOW_MS: AFTERGLOW_MS, cursorCount: cursorCount, pace: pace, byProject: byProject, liveBubble: liveBubble, rewindSeq: rewindSeq, addExtra: addExtra, startSeq: startSeq, bootChanged: bootChanged, num: num, tokens: tokens, money: money, pct: pct, date: date, hour: hour,
               ago: ago, weekKey: weekKey, coverage: coverage, pendingExtras: pendingExtras,
               nextVersion: nextVersion, answerApplies: answerApplies, queueReset: queueReset };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

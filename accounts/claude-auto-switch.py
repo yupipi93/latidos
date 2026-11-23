@@ -112,20 +112,12 @@ def parse_order(raw: str) -> tuple[list[str], list[str]]:
 
 def read_order_file(path: Path) -> str | None:
     """The priority saved by the Latidos page (`{"order": ["work", "home"]}`), or None."""
-    try:
-        order = json.loads(path.read_text()).get("order")
-    except (OSError, ValueError, AttributeError):
-        return None
-    return ",".join(str(t) for t in order) if isinstance(order, list) and order else None
+    return accounts_config.read_order_file(path)
 
 
 def _order_file() -> Path:
     """Where Latidos keeps its config: the same rules as its config_dir (audit of 43)."""
-    if os.environ.get("CLAUDE_ACCOUNTS_ORDER_FILE"):
-        return Path(os.path.expanduser(os.environ["CLAUDE_ACCOUNTS_ORDER_FILE"]))
-    base = os.environ.get("LATIDOS_CONFIG_DIR") or os.path.join(
-        os.environ.get("XDG_CONFIG_HOME") or str(HOME / ".config"), "latidos")
-    return Path(os.path.expanduser(base)) / "claude-order.json"
+    return accounts_config.order_file_path()
 
 
 # The priority the owner sets from the Latidos cards (menu or drag); the env var still wins.

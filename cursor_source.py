@@ -27,6 +27,7 @@ import datetime as dt
 import glob
 import re
 import json
+import math
 import os
 import sqlite3
 import time
@@ -77,6 +78,36 @@ CREATE INDEX IF NOT EXISTS cursor_events_ts ON cursor_events(ts);
 """
 
 API = "https://cursor.com"
+
+CENTS_CAP = 1e8      # a million dollars: no request costs more; a bigger figure is bogus
+TOKENS_CAP = 10 ** 12
+
+
+def sane_cents(v):
+    """Cents from Cursor as a finite number from 0 to CENTS_CAP (missing: 0), or None when
+    the figure is bogus (inf, 1e999, negative, not a number): the event is then dropped
+    rather than stored as inf (audit of 105)."""
+    if v is None or v == "":
+        return 0.0
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) and 0 <= f <= CENTS_CAP else None
+
+
+def sane_tokens(v):
+    """A token count from 0 to TOKENS_CAP (missing: 0), or None when it is bogus."""
+    if v is None or v == "":
+        return 0
+    try:
+        f = float(v)
+        if not math.isfinite(f):
+            return None
+        n = int(f)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return n if 0 <= n <= TOKENS_CAP else None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -209,22 +240,30 @@ class CursorApi:
                 events = data.get("usageEventsDisplay") or []
                 rows = []
                 for e in events:
+                    if not isinstance(e, dict):
+                        continue
                     tu = e.get("tokenUsage") or {}
+                    if not isinstance(tu, dict):
+                        tu = {}
                     try:
                         ts = int(e.get("timestamp"))
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         continue
                     # chargedCents is what Cursor bills (token price plus its own fee; also set
                     # on requests included in the plan); totalCents is the token list price.
                     cents = e.get("chargedCents")
                     if cents is None:
                         cents = tu.get("totalCents") or 0
+                    # Every figure range-checked: one bogus event is dropped, the page goes on.
+                    nums = [sane_tokens(tu.get("inputTokens")), sane_tokens(tu.get("outputTokens")),
+                            sane_tokens(tu.get("cacheReadTokens")), sane_cents(cents), sane_cents(tu.get("totalCents"))]
+                    if any(x is None for x in nums):
+                        continue
+                    itok, otok, cread, cents, list_cents = nums
                     eid = e.get("usageEventId") or "%s:%s:%s" % (ts, e.get("model"), cents)
                     oldest = ts if oldest is None else min(oldest, ts)
                     rows.append((eid, ts, e.get("model"), e.get("kind"), e.get("conversationId") or None,
-                                 int(tu.get("inputTokens") or 0), int(tu.get("outputTokens") or 0),
-                                 int(tu.get("cacheReadTokens") or 0), float(cents or 0),
-                                 1 if e.get("isHeadless") else 0, float(tu.get("totalCents") or 0)))
+                                 itok, otok, cread, cents, 1 if e.get("isHeadless") else 0, list_cents))
                 with self.lock:
                     before = self.con.total_changes
                     # Only rows that are new or really changed count (the overlap re-reads
@@ -351,10 +390,9 @@ def legacy_cents(usage_json):
     if isinstance(data, dict):
         for v in data.values():
             if isinstance(v, dict):
-                try:
-                    total += float(v.get("costInCents") or 0)
-                except (TypeError, ValueError):
-                    pass
+                c = sane_cents(v.get("costInCents"))
+                if c is not None:  # a bogus figure is left out (audit of 105)
+                    total += c
     return total
 
 
